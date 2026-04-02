@@ -1,6 +1,5 @@
-def main():
-    print("Hello from fastads!")
+from fastads.cli import app
 
 
 if __name__ == "__main__":
-    main()
+    app()

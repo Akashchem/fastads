@@ -1,9 +1,13 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "fastads"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.11"
 dependencies = [
     "faster-whisper>=1.2.1",
     "httpx>=0.28.1",
@@ -14,6 +18,12 @@ dependencies = [
     "python-dotenv>=1.2.2",
     "typer>=0.24.1",
 ]
+
+[project.scripts]
+fastads = "fastads.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fastads"]
 
 [dependency-groups]
 dev = [
