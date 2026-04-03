@@ -1,5 +1,6 @@
 from pathlib import Path
 import json
+import re
 import shutil
 import subprocess
 from urllib import error, request
@@ -310,7 +311,7 @@ def analyze_transcript(job_dir: str) -> int:
         hook_segment: dict[str, str | float] | None = None
 
         for index, segment in enumerate(normalized_segments):
-            stage = classify_segment_with_llm(str(segment["text"])) or classify_segment(
+            stage = choose_segment_stage(
                 str(segment["text"]),
                 is_first=index == 0,
             )
@@ -376,6 +377,14 @@ def analyze_transcript(job_dir: str) -> int:
             "cta_before_value": compare_stage_times(first_cta_time, first_value_time),
             "offer_before_cta": compare_stage_times(first_offer_time, first_cta_time),
         }
+        issues, recommendations = build_issues_and_recommendations(
+            hook=hook_segment,
+            offers=offers,
+            proof_points=proof_points,
+            first_cta_time=first_cta_time,
+            first_value_time=first_value_time,
+            cta_count=len(ctas),
+        )
 
         insights = {
             "ad_id": ad_id,
@@ -395,6 +404,8 @@ def analyze_transcript(job_dir: str) -> int:
             "first_proof_time": first_proof_time,
             "first_offer_time": first_offer_time,
             "cta_count": len(ctas),
+            "issues": issues,
+            "recommendations": recommendations,
         }
 
         write_json(insights_path, insights)
@@ -477,17 +488,22 @@ def classify_segment(text: str, *, is_first: bool = False) -> str:
     )
     cta_keywords = (
         "buy",
-        "shop",
-        "order",
         "join",
         "click",
+        "register",
+        "enroll",
+        "apply",
+        "book now",
+        "book",
         "खरीदो",
         "ऑर्डर",
         "जॉइन",
-        "अभी",
+        "रजिस्टर",
+        "क्लिक",
     )
     proof_keywords = (
         "result",
+        "results",
         "trusted",
         "review",
         "experience",
@@ -495,6 +511,14 @@ def classify_segment(text: str, *, is_first: bool = False) -> str:
         "guarantee",
         "proven",
         "testimonial",
+        "transform",
+        "transformation",
+        "achieved",
+        "already",
+        "log kar chuke",
+        "solve ho gaya",
+        "सॉल्व हो गया",
+        "हो गया",
     )
     value_keywords = (
         "improve",
@@ -508,21 +532,46 @@ def classify_segment(text: str, *, is_first: bool = False) -> str:
         "help",
         "solve",
         "transform",
+        "step by step",
+        "live",
+        "recording",
+        "what you get",
+        "get access",
+        "feature",
+        "features",
     )
 
     if contains_keyword(text, pain_keywords):
         return "pain_point"
     if contains_keyword(text, offer_keywords):
         return "offer"
-    if contains_keyword(text, cta_keywords):
-        return "cta"
     if contains_keyword(text, proof_keywords):
         return "proof"
     if contains_keyword(text, value_keywords):
         return "value_prop"
+    if contains_keyword(text, cta_keywords):
+        return "cta"
     if is_first and is_meaningful_text(text):
         return "hook"
     return "filler"
+
+
+def choose_segment_stage(text: str, *, is_first: bool = False) -> str:
+    llm_label = classify_segment_with_llm(text)
+    fallback_label = classify_segment(text, is_first=is_first)
+    stage = llm_label or fallback_label
+
+    if is_first and is_strong_hook(text):
+        return "hook"
+    if is_proof_text(text):
+        return "proof"
+    if has_cta_intent(text) and not is_proof_like_action_text(text):
+        return "cta"
+    if is_value_prop_text(text):
+        return "value_prop"
+    if stage == "cta" and not has_explicit_cta_action(text):
+        return fallback_label if fallback_label != "cta" else "filler"
+    return stage
 
 
 def classify_hook_type(text: str) -> str:
@@ -584,3 +633,180 @@ def build_primary_structure(ad_flow: list[dict[str, str | float]]) -> str:
         if stage in included_stages and stage not in ordered:
             ordered.append(stage)
     return " -> ".join(ordered)
+
+
+def build_issues_and_recommendations(
+    *,
+    hook: dict[str, str | float],
+    offers: list[dict[str, str | float]],
+    proof_points: list[dict[str, str | float]],
+    first_cta_time: float | None,
+    first_value_time: float | None,
+    cta_count: int,
+) -> tuple[list[str], list[str]]:
+    issues: list[str] = []
+    recommendations: list[str] = []
+
+    if (
+        first_cta_time is not None
+        and first_value_time is not None
+        and first_cta_time < first_value_time
+    ):
+        issues.append("CTA appears before value delivery")
+        recommendations.append("Move CTA after explaining value")
+
+    if not offers:
+        issues.append("No clear offer or incentive present")
+        recommendations.append("Add pricing, discount, or bonus to improve conversion")
+
+    hook_text = str(hook.get("text", "")).strip()
+    hook_type = str(hook.get("type", "")).strip().lower()
+    if (len(hook_text.split()) < 5 or hook_type == "generic") and not is_strong_hook(hook_text):
+        issues.append("Hook is weak or not attention-grabbing")
+        recommendations.append("Start with a stronger, disruptive or emotional hook")
+
+    if cta_count > 2:
+        issues.append("Too many CTAs may confuse the user")
+        recommendations.append("Limit to 1–2 strong CTAs")
+
+    if not proof_points:
+        issues.append("No proof or credibility signals present")
+        recommendations.append("Add testimonials, results, or social proof")
+
+    return issues, recommendations
+
+
+def is_strong_hook(text: str) -> bool:
+    strong_hook_keywords = (
+        "bakwas",
+        "bakwass",
+        "waste",
+        "scam",
+        "wrong",
+        "bad",
+        "stop",
+        "don't",
+        "never",
+        "useless",
+        "बकवास",
+        "बकुवास",
+        "गलत",
+        "मत",
+        "नहीं",
+    )
+    return contains_keyword(text, strong_hook_keywords)
+
+
+def has_explicit_cta_action(text: str) -> bool:
+    cta_action_keywords = (
+        "join",
+        "click",
+        "register",
+        "buy",
+        "enroll",
+        "apply",
+        "book now",
+        "book",
+        "जॉइन",
+        "क्लिक",
+        "रजिस्टर",
+        "खरीदो",
+        "ऑर्डर",
+        "kar lo",
+        "कर लो",
+        "ले लो",
+    )
+    return contains_keyword(text, cta_action_keywords)
+
+
+def has_cta_intent(text: str) -> bool:
+    lowered = text.lower()
+    cta_patterns = (
+        r"\bjoin\b",
+        r"\bclick\b",
+        r"\bregister\b",
+        r"\bbook\b",
+        r"\bapply\b",
+        r"\benroll\b",
+        r"\bjoin\s+kar\s+lo\b",
+        r"\bclick\s+kar(?:o|e)?\b",
+        r"\bregister\s+kar(?:o|e)?\b",
+        r"\bbook\s+now\b",
+        r"\bkar\s*lo\b",
+        r"\bkarle\b",
+        r"\babhi\b.*\b(join|click|register|book|apply|enroll)\b",
+        r"\b(book|click|register)\b.*\bkar\b",
+        r"\bbook\b.*\bna\b.*\bpe\b",
+        r"\bclick\b.*\bkar\b.*\b(register|book)\b",
+        r"जॉइन",
+        r"क्लिक",
+        r"रजिस्टर",
+        r"कर लो",
+        r"बुक",
+    )
+    return any(re.search(pattern, lowered) for pattern in cta_patterns)
+
+
+def is_proof_like_action_text(text: str) -> bool:
+    proof_override_keywords = (
+        "kar chuke hain",
+        "kar chuke hai",
+        "already",
+        "people have done",
+        "log join kar chuke",
+        "लोग",
+        "कर चुके",
+    )
+    return contains_keyword(text, proof_override_keywords)
+
+
+def is_proof_text(text: str) -> bool:
+    proof_keywords = (
+        "result",
+        "results",
+        "transform",
+        "transformation",
+        "achieved",
+        "already",
+        "users",
+        "proven",
+        "testimonial",
+        "log kar chuke",
+        "kar chuke",
+        "कर चुके",
+        "लोग",
+        "सारे लोग",
+        "solve ho gaya",
+        "हो गया",
+    )
+    return contains_keyword(text, proof_keywords)
+
+
+def is_value_prop_text(text: str) -> bool:
+    value_keywords = (
+        "step by step",
+        "learn",
+        "training",
+        "course details",
+        "live",
+        "recording",
+        "what you get",
+        "get access",
+        "benefit",
+        "features",
+        "feature",
+        "easy",
+        "effective",
+        "save",
+        "better",
+        "मिलेगी",
+        "लाइव",
+        "रिकॉर्डिंग",
+        "सीख",
+        "स्टेप बाय स्टेप",
+        "मिलने वाली",
+        "मिलने वाले",
+        "ट्रेनिंग",
+        "कोर्स",
+    )
+    return contains_keyword(text, value_keywords)

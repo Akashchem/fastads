@@ -52,6 +52,17 @@ def classify_segment_with_llm(text: str) -> str | None:
                             "content": (
                                 "Classify this ad segment into one of "
                                 "[hook, pain_point, value_prop, proof, offer, cta, filler]. "
+                                "CTA: only use cta if there is a clear user action instruction such as "
+                                "join, click, register, buy, enroll, apply, or informal action phrasing like kar lo. "
+                                "Conversational CTA such as 'to abhi join kar lo' must be cta. "
+                                "Do not classify statements or results as cta. "
+                                "Value Prop: explanations of benefits, features, learning, training, course details, "
+                                "live format, recording access, or what the user gets must be value_prop, not filler. "
+                                "Proof: if text describes results, transformation, or that people have "
+                                "already achieved something, classify as proof, never cta. "
+                                "Hook: if the first line is bold, negative, or controversial, treat it as a strong hook. "
+                                "If unsure between filler and cta, prefer cta when action intent exists. "
+                                "If unsure between cta and proof, choose proof. "
                                 "Return only label."
                             ),
                         },
