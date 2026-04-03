@@ -1,8 +1,14 @@
 import re
 
 import httpx
+import typer
 
-from fastads.config import FASTADS_LLM_API_BASE, FASTADS_LLM_MODEL, FASTADS_OPENAI_API_KEY
+from fastads.config import (
+    FASTADS_LLM_API_BASE,
+    FASTADS_LLM_API_KEY,
+    FASTADS_LLM_MODEL,
+    FASTADS_LLM_PROVIDER,
+)
 
 VALID_SEGMENT_LABELS = {
     "hook",
@@ -13,19 +19,29 @@ VALID_SEGMENT_LABELS = {
     "cta",
     "filler",
 }
+_has_logged_provider = False
 
 
 def classify_segment_with_llm(text: str) -> str | None:
-    if not FASTADS_OPENAI_API_KEY or not text.strip():
+    global _has_logged_provider
+
+    if not FASTADS_LLM_API_KEY or not text.strip():
         return None
+
+    if not _has_logged_provider:
+        typer.echo(
+            f"Using LLM classifier provider={FASTADS_LLM_PROVIDER} model={FASTADS_LLM_MODEL}"
+        )
+        _has_logged_provider = True
 
     try:
         with httpx.Client(timeout=20.0) as client:
             response = client.post(
                 f"{FASTADS_LLM_API_BASE}/chat/completions",
                 headers={
-                    "Authorization": f"Bearer {FASTADS_OPENAI_API_KEY}",
+                    "Authorization": f"Bearer {FASTADS_LLM_API_KEY}",
                     "Content-Type": "application/json",
+                    **provider_headers(),
                 },
                 json={
                     "model": FASTADS_LLM_MODEL,
@@ -59,6 +75,15 @@ def classify_segment_with_llm(text: str) -> str | None:
         .lower()
     )
     return extract_label(content)
+
+
+def provider_headers() -> dict[str, str]:
+    if FASTADS_LLM_PROVIDER != "openrouter":
+        return {}
+    return {
+        "HTTP-Referer": "https://github.com/Akashchem/fastads",
+        "X-Title": "FastAds",
+    }
 
 
 def extract_label(content: str) -> str | None:
