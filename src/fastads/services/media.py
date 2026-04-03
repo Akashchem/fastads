@@ -434,6 +434,18 @@ def analyze_transcript(job_dir: str) -> int:
         write_json(insights_path, insights)
         media_meta["insights_path"] = "insights.json"
         write_json(media_meta_path, media_meta)
+        print_ad_summary(
+            ad_id=ad_id,
+            ad_score=score_payload["ad_score"],
+            primary_structure=insights["primary_structure"],
+            hook=hook_segment,
+            proof_points=proof_points,
+            value_props=value_props,
+            ctas=ctas,
+            offers=offers,
+            first_cta_time=first_cta_time,
+            improvements=improvements,
+        )
         analyzed_count += 1
 
     typer.echo(f"Analyzed transcripts for {analyzed_count} ads")
@@ -773,6 +785,47 @@ def build_improvements(
         improvements.append("Make the opening hook more disruptive, emotional, or curiosity-driven")
 
     return improvements
+
+
+def print_ad_summary(
+    *,
+    ad_id: str,
+    ad_score: int,
+    primary_structure: str,
+    hook: dict[str, str | float],
+    proof_points: list[dict[str, str | float]],
+    value_props: list[dict[str, str | float]],
+    ctas: list[dict[str, str | float]],
+    offers: list[dict[str, str | float]],
+    first_cta_time: float | None,
+    improvements: list[str],
+) -> None:
+    hook_status = "Strong" if str(hook.get("text", "")).strip() else "Missing"
+    proof_status = "Present" if proof_points else "Missing"
+    value_status = "Present" if value_props else "Missing"
+    offer_status = "Present" if offers else "Missing"
+    if ctas and first_cta_time is not None:
+        cta_status = f"Present ({first_cta_time:.2f}s)"
+    elif ctas:
+        cta_status = "Present"
+    else:
+        cta_status = "Missing"
+
+    typer.echo("")
+    typer.echo(f"Ad: {ad_id}")
+    typer.echo(f"Score: {ad_score}/100")
+    typer.echo(f"Flow: {primary_structure}")
+    typer.echo(f"Hook: {hook_status}")
+    typer.echo(f"Proof: {proof_status}")
+    typer.echo(f"Value: {value_status}")
+    typer.echo(f"CTA: {cta_status}")
+    typer.echo(f"Offer: {offer_status}")
+    typer.echo("Top Improvements:")
+    if improvements:
+        for index, improvement in enumerate(improvements[:3], start=1):
+            typer.echo(f"{index}. {improvement}")
+    else:
+        typer.echo("1. None")
 
 
 def is_strong_hook(text: str) -> bool:
