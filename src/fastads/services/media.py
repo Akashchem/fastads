@@ -385,6 +385,14 @@ def analyze_transcript(job_dir: str) -> int:
             first_value_time=first_value_time,
             cta_count=len(ctas),
         )
+        improvements = build_improvements(
+            hook=hook_segment,
+            offers=offers,
+            value_props=value_props,
+            ctas=ctas,
+            proof_points=proof_points,
+            cta_before_value=structure_labels["cta_before_value"],
+        )
         score_payload = build_ad_scores(
             hook=hook_segment,
             proof_points=proof_points,
@@ -414,6 +422,7 @@ def analyze_transcript(job_dir: str) -> int:
             "cta_count": len(ctas),
             "issues": issues,
             "recommendations": recommendations,
+            "improvements": improvements,
             "hook_score": score_payload["hook_score"],
             "proof_score": score_payload["proof_score"],
             "value_score": score_payload["value_score"],
@@ -727,6 +736,43 @@ def build_ad_scores(
         "offer_score": offer_score,
         "ad_score": ad_score,
     }
+
+
+def build_improvements(
+    *,
+    hook: dict[str, str | float],
+    offers: list[dict[str, str | float]],
+    value_props: list[dict[str, str | float]],
+    ctas: list[dict[str, str | float]],
+    proof_points: list[dict[str, str | float]],
+    cta_before_value: bool,
+) -> list[str]:
+    improvements: list[str] = []
+
+    if cta_before_value:
+        improvements.append("Move CTA after explaining the value proposition")
+
+    if not offers:
+        improvements.append("Add a price hook, discount, bonus, or urgency offer")
+
+    if not value_props:
+        improvements.append("Explain the user benefit more clearly before asking for action")
+
+    cta_count = len(ctas)
+    if cta_count == 0:
+        improvements.append("Add a clear CTA like join, click, register, or buy now")
+    if cta_count > 2:
+        improvements.append("Reduce the number of CTAs to 1 or 2 strong action moments")
+
+    if not proof_points:
+        improvements.append("Add social proof, outcomes, or transformation evidence")
+
+    hook_type = str(hook.get("type", "")).strip().lower()
+    hook_text = str(hook.get("text", "")).strip()
+    if hook_text and hook_type == "generic":
+        improvements.append("Make the opening hook more disruptive, emotional, or curiosity-driven")
+
+    return improvements
 
 
 def is_strong_hook(text: str) -> bool:
