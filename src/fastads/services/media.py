@@ -1,4 +1,6 @@
 from pathlib import Path
+import shutil
+import subprocess
 from urllib import error, request
 
 import typer
@@ -55,13 +57,16 @@ def prepare_media(job_dir: str) -> int:
 def download_media(job_dir: str) -> tuple[int, int]:
     job_path = Path(job_dir)
     media_root = job_path / "media"
+    fallback_source = repo_root() / "assets" / "sample.mp4"
 
     if not media_root.exists():
         typer.echo("Downloaded media for 0 ads, failed for 0 ads")
+        typer.echo("Used fallback copy for 0 ads")
         return 0, 0
 
     downloaded_count = 0
     failed_count = 0
+    fallback_count = 0
 
     for media_dir in sorted(path for path in media_root.iterdir() if path.is_dir()):
         media_meta_path = media_dir / "media_meta.json"
@@ -74,40 +79,119 @@ def download_media(job_dir: str) -> tuple[int, int]:
             continue
 
         video_url = media_meta.get("video_url")
-
-        if not video_url:
-            media_meta["status"] = "download_failed"
-            media_meta["error"] = "Missing video_url"
-            write_json(media_meta_path, media_meta)
-            failed_count += 1
-            continue
-
         local_video_path = media_dir / "source.mp4"
+        media_dir.mkdir(parents=True, exist_ok=True)
+        download_error: str | None = None
 
-        try:
-            with request.urlopen(str(video_url), timeout=30) as response:
-                local_video_path.write_bytes(response.read())
-        except (error.URLError, OSError, ValueError) as exc:
-            media_meta["status"] = "download_failed"
-            media_meta["error"] = str(exc)
-            media_meta.pop("local_video_path", None)
-            write_json(media_meta_path, media_meta)
+        if video_url:
+            try:
+                with request.urlopen(str(video_url), timeout=30) as response:
+                    local_video_path.write_bytes(response.read())
+            except (error.URLError, OSError, ValueError) as exc:
+                download_error = str(exc)
+                failed_count += 1
+        else:
+            download_error = "Missing video_url"
             failed_count += 1
-            continue
+
+        if not local_video_path.exists():
+            if not fallback_source.exists():
+                typer.echo(
+                    f"Error: fallback media file not found: {fallback_source}",
+                    err=True,
+                )
+                raise typer.Exit(code=1)
+
+            shutil.copy(fallback_source, local_video_path)
+            fallback_count += 1
 
         media_meta["status"] = "downloaded"
-        media_meta["local_video_path"] = str(local_video_path)
-        media_meta.pop("error", None)
+        media_meta["local_video_path"] = "source.mp4"
+        if download_error:
+            media_meta["error"] = download_error
+        else:
+            media_meta.pop("error", None)
         write_json(media_meta_path, media_meta)
-        downloaded_count += 1
+        if download_error is None:
+            downloaded_count += 1
 
     typer.echo(
         f"Downloaded media for {downloaded_count} ads, failed for {failed_count} ads"
     )
+    typer.echo(f"Used fallback copy for {fallback_count} ads")
     return downloaded_count, failed_count
+
+
+def extract_media(job_dir: str) -> int:
+    job_path = Path(job_dir)
+    media_root = job_path / "media"
+
+    if not media_root.exists():
+        typer.echo("Processed media for 0 ads")
+        return 0
+
+    processed_count = 0
+
+    for media_dir in sorted(path for path in media_root.iterdir() if path.is_dir()):
+        source_path = media_dir / "source.mp4"
+        media_meta_path = media_dir / "media_meta.json"
+
+        if not source_path.exists() or not media_meta_path.exists():
+            continue
+
+        frames_dir = media_dir / "frames"
+        audio_path = media_dir / "audio.wav"
+        frames_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    str(source_path),
+                    "-vf",
+                    "fps=1",
+                    str(frames_dir / "frame_%03d.jpg"),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    str(source_path),
+                    str(audio_path),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.CalledProcessError:
+            continue
+
+        media_meta = read_json(media_meta_path)
+        if not isinstance(media_meta, dict):
+            continue
+
+        media_meta["status"] = "processed"
+        media_meta["frames_dir"] = "frames/"
+        media_meta["audio_path"] = "audio.wav"
+        write_json(media_meta_path, media_meta)
+        processed_count += 1
+
+    typer.echo(f"Processed media for {processed_count} ads")
+    return processed_count
 
 
 def read_json(path: Path):
     import json
 
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def repo_root() -> Path:
+    return Path(__file__).resolve().parents[3]
