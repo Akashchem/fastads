@@ -1,9 +1,11 @@
 from pathlib import Path
+import json
 import shutil
 import subprocess
 from urllib import error, request
 
 import typer
+from faster_whisper import WhisperModel
 
 from fastads.storage import write_json
 
@@ -187,9 +189,80 @@ def extract_media(job_dir: str) -> int:
     return processed_count
 
 
-def read_json(path: Path):
-    import json
+def transcribe_media(job_dir: str) -> int:
+    job_path = Path(job_dir)
+    media_root = job_path / "media"
 
+    if not media_root.exists():
+        typer.echo("Transcribed 0 ads")
+        typer.echo("Failed transcription for 0 ads")
+        return 0
+
+    transcribed_count = 0
+    failed_count = 0
+    model: WhisperModel | None = None
+    model_error: str | None = None
+
+    try:
+        model = WhisperModel("small")
+    except Exception as exc:
+        model_error = str(exc)
+
+    for media_dir in sorted(path for path in media_root.iterdir() if path.is_dir()):
+        audio_path = media_dir / "audio.wav"
+        media_meta_path = media_dir / "media_meta.json"
+        transcript_path = media_dir / "transcript.txt"
+        transcript_segments_path = media_dir / "transcript_segments.json"
+
+        if not audio_path.exists() or not media_meta_path.exists():
+            continue
+
+        media_meta = read_json(media_meta_path)
+        if not isinstance(media_meta, dict):
+            continue
+
+        if model is None:
+            media_meta["transcription_error"] = model_error or "Failed to load model"
+            write_json(media_meta_path, media_meta)
+            failed_count += 1
+            continue
+
+        try:
+            segments, _info = model.transcribe(str(audio_path))
+            segment_payload = [
+                {
+                    "start": segment.start,
+                    "end": segment.end,
+                    "text": segment.text.strip(),
+                }
+                for segment in segments
+            ]
+            transcript_text = " ".join(
+                segment["text"] for segment in segment_payload if segment["text"]
+            ).strip()
+        except Exception as exc:
+            media_meta["transcription_error"] = str(exc)
+            write_json(media_meta_path, media_meta)
+            failed_count += 1
+            continue
+
+        transcript_path.write_text(transcript_text, encoding="utf-8")
+        transcript_segments_path.write_text(
+            json.dumps(segment_payload, indent=2),
+            encoding="utf-8",
+        )
+        media_meta["transcript_path"] = "transcript.txt"
+        media_meta["transcript_segments_path"] = "transcript_segments.json"
+        media_meta.pop("transcription_error", None)
+        write_json(media_meta_path, media_meta)
+        transcribed_count += 1
+
+    typer.echo(f"Transcribed {transcribed_count} ads")
+    typer.echo(f"Failed transcription for {failed_count} ads")
+    return transcribed_count
+
+
+def read_json(path: Path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
