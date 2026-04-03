@@ -5,6 +5,7 @@ import typer
 
 from fastads.models import JobConfig, NormalizedAd
 from fastads.services.media import (
+    analyze_transcript,
     download_media,
     extract_media,
     prepare_media,
@@ -21,6 +22,7 @@ def run_pipeline(job_config: JobConfig) -> None:
     media_downloaded_ads, media_failed_ads = download_media(str(job_dir))
     extract_media(str(job_dir))
     transcribe_media(str(job_dir))
+    analyze_transcript(str(job_dir))
     output_path = job_dir / "pipeline_output.json"
     write_json(
         output_path,
