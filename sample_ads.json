@@ -1,0 +1,30 @@
+[
+  {
+    "ad_id": "ad_1",
+    "page_name": "BrandX",
+    "market": "IN",
+    "ad_copy": "This product changed my life",
+    "headline": "Shop the new launch",
+    "cta": "Shop Now",
+    "landing_page_url": "https://brandx.com/product1",
+    "video_url": "https://example.com/video1.mp4",
+    "format": "video",
+    "first_seen_at": "2026-03-20",
+    "last_seen_at": "2026-04-01",
+    "is_active": true
+  },
+  {
+    "ad_id": "ad_2",
+    "page_name": "BrandX",
+    "market": "IN",
+    "ad_copy": "Limited time 50% off",
+    "headline": "Offer ends soon",
+    "cta": "Buy Now",
+    "landing_page_url": "https://brandx.com/product2",
+    "video_url": "https://example.com/video2.mp4",
+    "format": "video",
+    "first_seen_at": "2026-03-18",
+    "last_seen_at": "2026-04-01",
+    "is_active": true
+  }
+]

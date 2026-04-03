@@ -11,6 +11,6 @@ def create_job_dir(job_id: str) -> Path:
     return job_dir
 
 
-def write_json(path: Path, data: dict[str, Any]) -> None:
+def write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")

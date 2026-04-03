@@ -10,5 +10,6 @@ class JobConfig(BaseModel):
 
 class NormalizedAd(BaseModel):
     ad_id: str
-    title: str | None = None
-    body: str | None = None
+    page_name: str
+    ad_copy: str
+    video_url: str
