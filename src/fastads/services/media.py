@@ -385,6 +385,14 @@ def analyze_transcript(job_dir: str) -> int:
             first_value_time=first_value_time,
             cta_count=len(ctas),
         )
+        score_payload = build_ad_scores(
+            hook=hook_segment,
+            proof_points=proof_points,
+            value_props=value_props,
+            ctas=ctas,
+            offers=offers,
+            cta_before_value=structure_labels["cta_before_value"],
+        )
 
         insights = {
             "ad_id": ad_id,
@@ -406,6 +414,12 @@ def analyze_transcript(job_dir: str) -> int:
             "cta_count": len(ctas),
             "issues": issues,
             "recommendations": recommendations,
+            "hook_score": score_payload["hook_score"],
+            "proof_score": score_payload["proof_score"],
+            "value_score": score_payload["value_score"],
+            "cta_score": score_payload["cta_score"],
+            "offer_score": score_payload["offer_score"],
+            "ad_score": score_payload["ad_score"],
         }
 
         write_json(insights_path, insights)
@@ -674,6 +688,45 @@ def build_issues_and_recommendations(
         recommendations.append("Add testimonials, results, or social proof")
 
     return issues, recommendations
+
+
+def build_ad_scores(
+    *,
+    hook: dict[str, str | float],
+    proof_points: list[dict[str, str | float]],
+    value_props: list[dict[str, str | float]],
+    ctas: list[dict[str, str | float]],
+    offers: list[dict[str, str | float]],
+    cta_before_value: bool,
+) -> dict[str, int]:
+    hook_text = str(hook.get("text", "")).strip()
+
+    hook_score = 20 if hook_text else 0
+    if hook_text and is_strong_hook(hook_text):
+        hook_score += 10
+
+    proof_score = 20 if proof_points else 0
+    value_score = 20 if value_props else 0
+
+    cta_score = 20 if ctas else 0
+    if cta_score and cta_before_value:
+        cta_score -= 10
+
+    offer_score = 10 if offers else 0
+
+    ad_score = min(
+        hook_score + proof_score + value_score + cta_score + offer_score,
+        100,
+    )
+
+    return {
+        "hook_score": hook_score,
+        "proof_score": proof_score,
+        "value_score": value_score,
+        "cta_score": cta_score,
+        "offer_score": offer_score,
+        "ad_score": ad_score,
+    }
 
 
 def is_strong_hook(text: str) -> bool:
