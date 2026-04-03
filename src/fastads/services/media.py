@@ -1,4 +1,5 @@
 from pathlib import Path
+from urllib import error, request
 
 import typer
 
@@ -49,6 +50,61 @@ def prepare_media(job_dir: str) -> int:
 
     typer.echo(f"Prepared media for {prepared_count} ads")
     return prepared_count
+
+
+def download_media(job_dir: str) -> tuple[int, int]:
+    job_path = Path(job_dir)
+    media_root = job_path / "media"
+
+    if not media_root.exists():
+        typer.echo("Downloaded media for 0 ads, failed for 0 ads")
+        return 0, 0
+
+    downloaded_count = 0
+    failed_count = 0
+
+    for media_dir in sorted(path for path in media_root.iterdir() if path.is_dir()):
+        media_meta_path = media_dir / "media_meta.json"
+        if not media_meta_path.exists():
+            continue
+
+        media_meta = read_json(media_meta_path)
+        if not isinstance(media_meta, dict):
+            failed_count += 1
+            continue
+
+        video_url = media_meta.get("video_url")
+
+        if not video_url:
+            media_meta["status"] = "download_failed"
+            media_meta["error"] = "Missing video_url"
+            write_json(media_meta_path, media_meta)
+            failed_count += 1
+            continue
+
+        local_video_path = media_dir / "source.mp4"
+
+        try:
+            with request.urlopen(str(video_url), timeout=30) as response:
+                local_video_path.write_bytes(response.read())
+        except (error.URLError, OSError, ValueError) as exc:
+            media_meta["status"] = "download_failed"
+            media_meta["error"] = str(exc)
+            media_meta.pop("local_video_path", None)
+            write_json(media_meta_path, media_meta)
+            failed_count += 1
+            continue
+
+        media_meta["status"] = "downloaded"
+        media_meta["local_video_path"] = str(local_video_path)
+        media_meta.pop("error", None)
+        write_json(media_meta_path, media_meta)
+        downloaded_count += 1
+
+    typer.echo(
+        f"Downloaded media for {downloaded_count} ads, failed for {failed_count} ads"
+    )
+    return downloaded_count, failed_count
 
 
 def read_json(path: Path):

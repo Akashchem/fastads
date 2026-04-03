@@ -4,7 +4,7 @@ from pathlib import Path
 import typer
 
 from fastads.models import JobConfig, NormalizedAd
-from fastads.services.media import prepare_media
+from fastads.services.media import download_media, prepare_media
 from fastads.storage import write_json
 
 
@@ -13,6 +13,7 @@ def run_pipeline(job_config: JobConfig) -> None:
     job_dir = job_dir_path(job_config.job_id)
     ads = ingest_ads(job_config.input_path, str(job_dir))
     media_prepared_ads = prepare_media(str(job_dir))
+    media_downloaded_ads, media_failed_ads = download_media(str(job_dir))
     output_path = job_dir / "pipeline_output.json"
     write_json(
         output_path,
@@ -24,6 +25,8 @@ def run_pipeline(job_config: JobConfig) -> None:
             "input_path": job_config.input_path,
             "ingested_ads": len(ads),
             "media_prepared_ads": media_prepared_ads,
+            "media_downloaded_ads": media_downloaded_ads,
+            "media_failed_ads": media_failed_ads,
         },
     )
 
