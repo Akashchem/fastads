@@ -8,6 +8,7 @@ from fastads.services.media import (
     analyze_transcript,
     download_media,
     extract_media,
+    extract_ocr,
     prepare_media,
     transcribe_media,
 )
@@ -21,6 +22,7 @@ def run_pipeline(job_config: JobConfig) -> None:
     media_prepared_ads = prepare_media(str(job_dir))
     media_downloaded_ads, media_failed_ads = download_media(str(job_dir))
     extract_media(str(job_dir))
+    extract_ocr(str(job_dir))
     transcribe_media(str(job_dir))
     analyze_transcript(str(job_dir))
     output_path = job_dir / "pipeline_output.json"
