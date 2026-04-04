@@ -1,3 +1,4 @@
+import base64
 from pathlib import Path
 import json
 import re
@@ -5,9 +6,19 @@ import shutil
 import subprocess
 from urllib import error, request
 
+import httpx
+from PIL import Image
+import pytesseract
 import typer
 from faster_whisper import WhisperModel
 
+from fastads.config import (
+    FASTADS_TRANSCRIBER,
+    WHISPER_MODEL,
+    WHISPER_API_URL,
+    WHISPER_AUTH_TOKEN,
+    WHISPER_RESPONSE_FORMAT,
+)
 from fastads.providers.llm import classify_segment_with_llm
 from fastads.storage import write_json
 
@@ -119,9 +130,7 @@ def download_media(job_dir: str) -> tuple[int, int]:
         if download_error is None:
             downloaded_count += 1
 
-    typer.echo(
-        f"Downloaded media for {downloaded_count} ads, failed for {failed_count} ads"
-    )
+    typer.echo(f"Downloaded media for {downloaded_count} ads, failed for {failed_count} ads")
     typer.echo(f"Used fallback copy for {fallback_count} ads")
     return downloaded_count, failed_count
 
@@ -191,6 +200,54 @@ def extract_media(job_dir: str) -> int:
     return processed_count
 
 
+def extract_ocr(job_dir: str) -> int:
+    job_path = Path(job_dir)
+    media_root = job_path / "media"
+
+    if not media_root.exists():
+        typer.echo("Extracted OCR for 0 ads")
+        return 0
+
+    extracted_count = 0
+
+    for media_dir in sorted(path for path in media_root.iterdir() if path.is_dir()):
+        frames_dir = media_dir / "frames"
+        media_meta_path = media_dir / "media_meta.json"
+        ocr_path = media_dir / "ocr.json"
+
+        if not frames_dir.exists() or not media_meta_path.exists():
+            continue
+
+        frame_results: list[dict[str, str]] = []
+        for frame_path in sorted(frames_dir.glob("*.jpg")):
+            try:
+                text = pytesseract.image_to_string(Image.open(frame_path)).strip()
+            except Exception:
+                continue
+
+            if not text:
+                continue
+
+            frame_results.append(
+                {
+                    "frame": frame_path.name,
+                    "text": text,
+                }
+            )
+
+        write_json(ocr_path, frame_results)
+        media_meta = read_json(media_meta_path)
+        if not isinstance(media_meta, dict):
+            continue
+
+        media_meta["ocr_path"] = "ocr.json"
+        write_json(media_meta_path, media_meta)
+        extracted_count += 1
+
+    typer.echo(f"Extracted OCR for {extracted_count} ads")
+    return extracted_count
+
+
 def transcribe_media(job_dir: str) -> int:
     job_path = Path(job_dir)
     media_root = job_path / "media"
@@ -200,15 +257,18 @@ def transcribe_media(job_dir: str) -> int:
         typer.echo("Failed transcription for 0 ads")
         return 0
 
+    typer.echo(f"Using transcriber: {FASTADS_TRANSCRIBER}")
+
     transcribed_count = 0
     failed_count = 0
     model: WhisperModel | None = None
     model_error: str | None = None
 
-    try:
-        model = WhisperModel("small")
-    except Exception as exc:
-        model_error = str(exc)
+    if FASTADS_TRANSCRIBER == "local":
+        try:
+            model = WhisperModel("small")
+        except Exception as exc:
+            model_error = str(exc)
 
     for media_dir in sorted(path for path in media_root.iterdir() if path.is_dir()):
         audio_path = media_dir / "audio.wav"
@@ -223,28 +283,18 @@ def transcribe_media(job_dir: str) -> int:
         if not isinstance(media_meta, dict):
             continue
 
-        if model is None:
-            media_meta["transcription_error"] = model_error or "Failed to load model"
-            write_json(media_meta_path, media_meta)
-            failed_count += 1
-            continue
-
         try:
-            segments, _info = model.transcribe(str(audio_path))
-            segment_payload = [
-                {
-                    "start": segment.start,
-                    "end": segment.end,
-                    "text": segment.text.strip(),
-                }
-                for segment in segments
-            ]
-            transcript_text = " ".join(
-                segment["text"] for segment in segment_payload if segment["text"]
-            ).strip()
+            transcript_text, segment_payload = transcribe_audio_file(
+                audio_path=audio_path,
+                model=model,
+                model_error=model_error,
+            )
         except Exception as exc:
             media_meta["transcription_error"] = str(exc)
             write_json(media_meta_path, media_meta)
+            if FASTADS_TRANSCRIBER == "remote":
+                typer.echo(f"Error: remote transcription failed for {audio_path}: {exc}", err=True)
+                raise typer.Exit(code=1) from exc
             failed_count += 1
             continue
 
@@ -262,6 +312,240 @@ def transcribe_media(job_dir: str) -> int:
     typer.echo(f"Transcribed {transcribed_count} ads")
     typer.echo(f"Failed transcription for {failed_count} ads")
     return transcribed_count
+
+
+def transcribe_audio_file(
+    *,
+    audio_path: Path,
+    model: WhisperModel | None,
+    model_error: str | None,
+) -> tuple[str, list[dict[str, str | float]]]:
+    if FASTADS_TRANSCRIBER == "remote":
+        return transcribe_audio_file_remote(audio_path)
+    return transcribe_audio_file_local(
+        audio_path=audio_path,
+        model=model,
+        model_error=model_error,
+    )
+
+
+def transcribe_audio_file_local(
+    *,
+    audio_path: Path,
+    model: WhisperModel | None,
+    model_error: str | None,
+) -> tuple[str, list[dict[str, str | float]]]:
+    if model is None:
+        raise RuntimeError(model_error or "Failed to load local transcriber model")
+
+    segments, _info = model.transcribe(str(audio_path))
+    segment_payload = [
+        {
+            "start": segment.start,
+            "end": segment.end,
+            "text": segment.text.strip(),
+        }
+        for segment in segments
+    ]
+    transcript_text = " ".join(
+        segment["text"] for segment in segment_payload if segment["text"]
+    ).strip()
+    return transcript_text, segment_payload
+
+
+def transcribe_audio_file_remote(
+    audio_path: Path,
+) -> tuple[str, list[dict[str, str | float]]]:
+    if not WHISPER_API_URL:
+        raise RuntimeError("WHISPER_API_URL is not set")
+    if not WHISPER_AUTH_TOKEN:
+        raise RuntimeError("WHISPER_AUTH_TOKEN is not set")
+
+    headers = {
+        "Authorization": f"Bearer {WHISPER_AUTH_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "audio_data": base64.b64encode(audio_path.read_bytes()).decode("ascii"),
+        "task": "transcribe",
+        "vad_filter": True,
+        "model": WHISPER_MODEL,
+        "response_format": WHISPER_RESPONSE_FORMAT,
+    }
+    response = httpx.post(
+        WHISPER_API_URL,
+        headers=headers,
+        json=payload,
+        timeout=120,
+    )
+
+    response.raise_for_status()
+    payload = response.json()
+    raw_transcriptions = payload.get("transcription", [])
+    raw_timestamps = payload.get("timestamps", [])
+    if not isinstance(raw_transcriptions, list) or not isinstance(raw_timestamps, list):
+        raise RuntimeError(
+            "Remote response is missing valid transcription or timestamps arrays"
+        )
+
+    segment_payload: list[dict[str, str | float]] = []
+    for text, timestamp_pair in zip(raw_transcriptions, raw_timestamps):
+        if not isinstance(timestamp_pair, list) or len(timestamp_pair) != 2:
+            continue
+        segment_text = str(text).strip()
+        if not segment_text:
+            continue
+        segment_payload.append(
+            {
+                "start": float(timestamp_pair[0]),
+                "end": float(timestamp_pair[1]),
+                "text": segment_text,
+            }
+        )
+
+    segment_payload = normalize_transcript_segments(segment_payload)
+
+    transcript_text = " ".join(
+        segment["text"] for segment in segment_payload if str(segment["text"]).strip()
+    ).strip()
+    if not transcript_text:
+        transcript_text = str(payload.get("text", "")).strip()
+    return transcript_text, segment_payload
+
+
+def normalize_transcript_segments(
+    segments: list[dict[str, str | float]],
+) -> list[dict[str, str | float]]:
+    normalized: list[dict[str, str | float]] = []
+    for segment in segments:
+        normalized.extend(split_long_segment(segment))
+    return normalized
+
+
+def split_long_segment(
+    segment: dict[str, str | float],
+) -> list[dict[str, str | float]]:
+    text = str(segment.get("text", "")).strip()
+    start = float(segment.get("start", 0.0))
+    end = float(segment.get("end", 0.0))
+    duration = max(end - start, 0.0)
+    word_count = len(text.split())
+
+    if not text:
+        return []
+    if word_count <= 12 and duration <= 6.0:
+        return [{"start": start, "end": end, "text": text}]
+
+    parts = split_text_naturally(text)
+    if len(parts) <= 1:
+        parts = split_text_by_word_count(text, max_words=10)
+    if len(parts) <= 1:
+        return [{"start": start, "end": end, "text": text}]
+
+    total_weight = sum(max(len(part), 1) for part in parts)
+    current_start = start
+    output: list[dict[str, str | float]] = []
+
+    for index, part in enumerate(parts):
+        weight = max(len(part), 1)
+        if index == len(parts) - 1:
+            current_end = end
+        else:
+            current_end = current_start + (duration * weight / total_weight)
+
+        output.append(
+            {
+                "start": round(current_start, 2),
+                "end": round(current_end, 2),
+                "text": part,
+            }
+        )
+        current_start = current_end
+
+    return output
+
+
+def split_text_naturally(text: str) -> list[str]:
+    parts = re.split(r"(?<=[\.\?\!,।])\s+", text)
+    cleaned = [part.strip(" ,") for part in parts if part.strip(" ,")]
+    if len(cleaned) > 1:
+        return cleaned
+
+    comma_parts = [part.strip(" ,") for part in text.split(",") if part.strip(" ,")]
+    return comma_parts
+
+
+def split_text_by_word_count(text: str, *, max_words: int) -> list[str]:
+    words = text.split()
+    if len(words) <= max_words:
+        return [text.strip()]
+
+    chunks: list[str] = []
+    for index in range(0, len(words), max_words):
+        chunk = " ".join(words[index : index + max_words]).strip()
+        if chunk:
+            chunks.append(chunk)
+    return chunks
+
+
+def ensure_extracted_defaults(extracted: dict[str, list[str]]) -> None:
+    for key in ("value_props", "offers", "pain_points", "proof_points"):
+        extracted.setdefault(key, [])
+
+
+def add_heuristic_extraction(text: str, extracted: dict[str, list[str]]) -> None:
+    if is_value_prop_text(text):
+        extracted["value_props"].append(text)
+    if contains_keyword(text, ("price", "rupees", "₹", "%", "off", "discount", "sale")):
+        extracted["offers"].append(text)
+    if is_proof_text(text):
+        extracted["proof_points"].append(text)
+    if contains_keyword(text, ("dark circles", "double chin", "puffiness", "wrinkles")):
+        extracted["pain_points"].append(text)
+
+
+def add_extracted_signals(
+    storage: dict[str, list[dict[str, str | float]]],
+    extracted: dict[str, list[str]],
+    segment: dict[str, str | float],
+) -> None:
+    if not extracted:
+        return
+
+    start = float(segment.get("start", 0.0))
+    end = float(segment.get("end", 0.0))
+
+    for key in ("value_props", "offers", "pain_points", "proof_points"):
+        for entry in extracted.get(key, []):
+            entry_text = str(entry).strip()
+            if not entry_text:
+                continue
+            storage[key].append(
+                {
+                    "start": start,
+                    "end": end,
+                    "text": entry_text,
+                }
+            )
+
+
+def debug_segment_outputs(
+    text: str,
+    flow_label: str | None,
+    extracted: dict[str, list[str]],
+) -> None:
+    global _segment_debug_count
+    if _segment_debug_count >= 3:
+        return
+    snippet = (text[:60] + "...") if len(text) > 60 else text
+    typer.echo(
+        f"Segment debug: '{snippet}' flow={flow_label or 'unknown'} extracted={ {k: len(v) for k, v in extracted.items()} }"
+    )
+    _segment_debug_count += 1
+
+
+_segment_debug_count = 0
 
 
 def analyze_transcript(job_dir: str) -> int:
@@ -302,18 +586,27 @@ def analyze_transcript(job_dir: str) -> int:
         full_text = " ".join(segment["text"] for segment in normalized_segments)
         language = "hindi_or_hinglish" if has_devanagari(full_text) else "english"
 
-        pain_points: list[dict[str, str | float]] = []
-        value_props: list[dict[str, str | float]] = []
-        offers: list[dict[str, str | float]] = []
+        aggregated_signals = {
+            "value_props": [],
+            "offers": [],
+            "pain_points": [],
+            "proof_points": [],
+        }
         ctas: list[dict[str, str | float]] = []
-        proof_points: list[dict[str, str | float]] = []
         ad_flow: list[dict[str, str | float]] = []
         hook_segment: dict[str, str | float] | None = None
 
         for index, segment in enumerate(normalized_segments):
+            llm_response = classify_segment_with_llm(segment["text"])
+            flow_label = llm_response.get("flow_label") if isinstance(llm_response, dict) else None
+            extracted = llm_response.get("extracted", {}) if isinstance(llm_response, dict) else {}
+            ensure_extracted_defaults(extracted)
+            add_heuristic_extraction(segment["text"], extracted)
+            debug_segment_outputs(segment["text"], flow_label, extracted)
             stage = choose_segment_stage(
                 str(segment["text"]),
                 is_first=index == 0,
+                llm_flow=flow_label,
             )
             block = {
                 "text": segment["text"],
@@ -324,15 +617,15 @@ def analyze_transcript(job_dir: str) -> int:
             if stage == "hook":
                 hook_segment = hook_segment or block
             elif stage == "pain_point":
-                pain_points.append(block)
+                pass
             elif stage == "value_prop":
-                value_props.append(block)
+                pass
             elif stage == "offer":
-                offers.append(block)
+                pass
             elif stage == "cta":
                 ctas.append(block)
             elif stage == "proof":
-                proof_points.append(block)
+                pass
 
             ad_flow.append(
                 {
@@ -342,6 +635,7 @@ def analyze_transcript(job_dir: str) -> int:
                     "end": segment["end"],
                 }
             )
+            add_extracted_signals(aggregated_signals, extracted, segment)
 
         if hook_segment is None:
             first_segment = normalized_segments[0]
@@ -365,6 +659,10 @@ def analyze_transcript(job_dir: str) -> int:
             if is_meaningful_text(segment["text"])
         ][:3]
         summary = " ".join(summary_segments).strip()
+        pain_points = aggregated_signals["pain_points"]
+        value_props = aggregated_signals["value_props"]
+        proof_points = aggregated_signals["proof_points"]
+        offers = aggregated_signals["offers"]
         first_pain_time = first_stage_time(pain_points)
         first_value_time = first_stage_time(value_props)
         first_proof_time = first_stage_time(proof_points)
@@ -591,10 +889,14 @@ def classify_segment(text: str, *, is_first: bool = False) -> str:
     return "filler"
 
 
-def choose_segment_stage(text: str, *, is_first: bool = False) -> str:
-    llm_label = classify_segment_with_llm(text)
+def choose_segment_stage(
+    text: str,
+    *,
+    is_first: bool = False,
+    llm_flow: str | None = None,
+) -> str:
     fallback_label = classify_segment(text, is_first=is_first)
-    stage = llm_label or fallback_label
+    stage = llm_flow or fallback_label
 
     if is_first and is_strong_hook(text):
         return "hook"
