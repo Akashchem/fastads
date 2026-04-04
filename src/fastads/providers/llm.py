@@ -48,20 +48,26 @@ def classify_segment_with_llm(text: str) -> str | None:
         {
             "role": "system",
             "content": (
-                "Classify this ad segment into one of "
-                "[hook, pain_point, value_prop, proof, offer, cta, filler]. "
-                "CTA: only use cta if there is a clear user action instruction such as "
-                "join, click, register, buy, enroll, apply, or informal phrasing like kar lo. "
-                "Conversational CTA such as 'to abhi join kar lo' must be cta. "
-                "Value Prop: explanations of benefits, features, learning, training, course details, "
-                "live format, recording access, or what the user gets must be value_prop, not filler. "
-                "Proof: if text describes results, transformation, or that people have "
-                "already achieved something, classify as proof, never cta. "
-                "Hook: if the first line is bold, negative, or controversial, treat it as a strong hook. "
-                "Pain Point: treat fragments like dark circles, double chin, puffiness, wrinkles as pain_points. "
-                "If unsure between filler and cta, prefer cta when action intent exists. "
-                "If unsure between cta and proof, choose proof. "
-                "Return JSON with flow_label and an extracted map."
+                "You are an ad analyst. Analyze the ad segment and return ONLY valid JSON in this exact format:\n"
+                "{\n"
+                '  "flow_label": "one of: hook | pain_point | value_prop | proof | offer | cta | filler",\n'
+                '  "extracted": {\n'
+                '    "pain_points": ["problems or symptoms, including fragments like dark circles, double chin, puffiness, wrinkles"],\n'
+                '    "value_props": ["benefits, features, format: live class, recording, step by step"],\n'
+                '    "offers": ["price or discount: 99 rupees, free, bonus"],\n'
+                '    "proof_points": ["results others achieved: pigmentation solve ho gaya"]\n'
+                "  }\n"
+                "}\n\n"
+                "Rules:\n"
+                "- flow_label must be exactly one label\n"
+                "- extracted fields may contain multiple items from the same segment\n"
+                "- Even if flow_label is cta, still extract value_props and offers present in the text\n"
+                "- Treat single word fragments like dark circles, puffiness, wrinkles as pain_points\n"
+                "- Proof: results already achieved by others\n"
+                "- If unsure between cta and proof, choose proof\n"
+                "- Always return all extracted keys even if empty\n"
+                "- offers: extract price as an offer ONLY when paired with value signals like sirf, सिर्फ, only, limited, special, abhi, अभी, ₹, rupees, rupiye, discount, or urgency words. A bare price with no framing is not an offer\n"
+                "- Return ONLY the JSON object, no explanation"
             ),
         },
         {
@@ -86,6 +92,7 @@ def classify_segment_with_llm(text: str) -> str | None:
                 json={
                     "model": FASTADS_LLM_MODEL,
                     "temperature": 0,
+                    "response_format": {"type": "json_object"},
                     "messages": messages,
                 },
             )
@@ -121,6 +128,8 @@ def classify_segment_with_azure_openai(messages: list[dict[str, str]]) -> str | 
             model=AZURE_OPENAI_DEPLOYMENT,
             messages=messages,
             max_completion_tokens=2048,
+            response_format={"type": "json_object"},  # ADD THIS
+
         )
     except Exception:
         return None
