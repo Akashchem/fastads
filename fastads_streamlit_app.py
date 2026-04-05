@@ -192,17 +192,11 @@ def safe_script_value(value: Any) -> str:
     return str(value)
 
 
-def _get_script_value(script: Dict[str, Any], keys: List[str]) -> str:
-    for key in keys:
-        value = script.get(key)
+def _get_script_value(script: Dict[str, Any], key: str) -> str:
+    for candidate in (key, key.capitalize(), key.upper()):
+        value = script.get(candidate)
         if value:
             return safe_script_value(value)
-        capitalized = script.get(key.capitalize())
-        if capitalized:
-            return safe_script_value(capitalized)
-        upper = script.get(key.upper())
-        if upper:
-            return safe_script_value(upper)
     return "—"
 
 
@@ -211,7 +205,6 @@ def _render_competitor_recipe(steps: List[Dict[str, Any]]) -> None:
         st.info("No competitor recipe steps were detected.")
         return
 
-    st.write("**Competitor Recipe**")
     for step in steps:
         cols = st.columns([1, 1, 2, 2])
         cols[0].write(safe_script_value(step.get("timestamp")))
@@ -220,8 +213,12 @@ def _render_competitor_recipe(steps: List[Dict[str, Any]]) -> None:
             f"**What:** {safe_script_value(step.get('what'))}\n"
             f"**Why:** {safe_script_value(step.get('why'))}"
         )
+        formula_value = step.get("formula")
+        formula_display = str(formula_value).strip() if formula_value else ""
+        if not formula_display:
+            formula_display = "N/A"
         cols[3].markdown(
-            f"**Formula:** {safe_script_value(step.get('formula'))}"
+            f"**Formula:** {formula_display}"
         )
 
 
@@ -235,10 +232,9 @@ def _get_step_field(step: Dict[str, Any], *keys: str) -> str:
 
 def _render_your_recipe(steps: List[Dict[str, Any]]) -> None:
     if not steps:
-        st.info("See Keep/Avoid/Test and Script below for your personalized recommendations.")
         return
 
-    st.write("**🎬 Your Recipe (Based on Your Goal)**")
+    st.write("**📋 Shot-by-Shot Breakdown**")
     for step in steps:
         cols = st.columns([1, 1, 3, 3])
         cols[0].write(safe_script_value(_get_step_field(step, "timestamp", "time")))
@@ -257,13 +253,25 @@ def build_strategy_display_payload(normalized: Optional[Dict[str, Any]]) -> Dict
     normalized = normalized or {}
     raw_your_recipe = normalized.get("your_recipe", {})
     your_recipe_steps: List[Dict[str, Any]] = []
-    if isinstance(raw_your_recipe, dict):
+    script_source: Dict[str, Any] = {}
+    script_stages: List[Dict[str, Any]] = []
+    if isinstance(script_source, dict):
+        for key in ("stages", "steps"):
+            candidate = script_source.get(key)
+            if isinstance(candidate, list):
+                script_stages = candidate
+                break
+    if script_stages:
+        your_recipe_steps = script_stages
+    elif isinstance(raw_your_recipe, dict):
         stages = raw_your_recipe.get("stages")
         steps = raw_your_recipe.get("steps")
         if isinstance(stages, list):
             your_recipe_steps = stages
         elif isinstance(steps, list):
             your_recipe_steps = steps
+        else:
+            your_recipe_steps = []
     elif isinstance(raw_your_recipe, list):
         your_recipe_steps = raw_your_recipe
 
@@ -282,18 +290,31 @@ def build_strategy_display_payload(normalized: Optional[Dict[str, Any]]) -> Dict
     if not isinstance(competitor_steps, list):
         competitor_steps = []
 
+    def _list_from_sources(key: str) -> List[Any]:
+        sources: List[Any] = []
+        if isinstance(raw_your_recipe, dict):
+            sources.append(raw_your_recipe)
+            plan_block = raw_your_recipe.get("plan")
+            if isinstance(plan_block, dict):
+                sources.append(plan_block)
+        sources.append(normalized)
+        sources.append({})
+        for source in sources:
+            if not isinstance(source, dict):
+                continue
+            value = source.get(key)
+            if isinstance(value, list):
+                return value
+            if isinstance(value, str) and value.strip():
+                return [value.strip()]
+        return []
+
     return {
         "competitor_recipe": competitor_steps,
         "your_recipe_steps": your_recipe_steps,
-        "keep": raw_your_recipe.get("keep")
-        if isinstance(raw_your_recipe, dict)
-        else normalized.get("keep", []),
-        "avoid": raw_your_recipe.get("avoid")
-        if isinstance(raw_your_recipe, dict)
-        else normalized.get("avoid", []),
-        "test": raw_your_recipe.get("test")
-        if isinstance(raw_your_recipe, dict)
-        else normalized.get("test", []),
+        "keep": _list_from_sources("keep"),
+        "avoid": _list_from_sources("avoid"),
+        "test": _list_from_sources("test"),
         "script": script_source,
     }
 
@@ -316,7 +337,7 @@ def _render_script_block(script: Dict[str, Any], ad_name: str) -> None:
         ("cta", "CTA"),
     ]
     for column, (key, label) in zip(script_columns, script_labels):
-        text = _get_script_value(script, [key, key.upper()])
+        text = _get_script_value(script, key)
         column.write(f"**{label}**")
         column.code(text)
         column.button(

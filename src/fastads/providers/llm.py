@@ -267,15 +267,24 @@ def _normalize_strategy_payload(payload: dict[str, Any]) -> tuple[dict[str, Any]
         your_steps = _coerce_steps(None, your_keys, allowed)
 
     def _ensure_list(key: str) -> List[str]:
-        source = None
+        sources: List[dict[str, Any]] = []
         if isinstance(your_raw, dict):
-            source = your_raw.get(key)
-        if source is None:
-            source = payload.get(key)
-        if isinstance(source, list):
-            return [str(item).strip() for item in source if str(item).strip()]
-        if isinstance(source, str) and source.strip():
-            return [source.strip()]
+            sources.append(your_raw)
+            for nested in ("plan", "goal", "approach"):
+                block = your_raw.get(nested)
+                if isinstance(block, dict):
+                    sources.append(block)
+        sources.append(payload)
+        for source in sources:
+            if not isinstance(source, dict):
+                continue
+            value = source.get(key)
+            if isinstance(value, list):
+                normalized = [str(item).strip() for item in value if str(item).strip()]
+                if normalized:
+                    return normalized
+            if isinstance(value, str) and value.strip():
+                return [value.strip()]
         return []
 
     script_source = None
@@ -334,12 +343,26 @@ def call_ad_strategy_llm(
         {
             "role": "system",
             "content": (
-                "You are a creative strategist writing marketing playbooks. Return ONLY valid JSON. "
+                "CRITICAL: You MUST populate these fields with real content. Empty strings and empty arrays are NOT acceptable. "
+                "Use the competitor ad only as inspiration. Generate NEW lines for the marketer's goal, not copied transcript lines. "
+                "If proof is weak or not explicitly present in the source ad, infer a credible proof angle from the available signals instead of leaving it blank. "
+                "script: Write 4 specific, ready-to-use lines a marketer can record immediately. "
+                "- hook: A single punchy opening line that stops the scroll (max 15 words). "
+                "- proof: A credibility line referencing results or social proof (max 20 words). "
+                "- value: What the viewer gets, stated as a benefit (max 20 words). "
+                "- cta: The exact action instruction (max 10 words). "
+                "your_recipe: An object with a stages array. Each stage must have: timestamp (e.g., '0-5s'), stage (Hook/Proof/Value/CTA), say (exact line to speak), show (what appears on screen), why (one sentence explanation). "
+                "Example script output: 'hook': 'Still struggling with dark circles after trying everything?', "
+                "'proof': '14,000 people solved this with face yoga in 21 days.', "
+                "'value': 'Join our live masterclass — includes recording and step-by-step guide.', "
+                "'cta': 'Register free — tap the link below.' "
+                "If you return empty strings or empty arrays for these fields, your response is INVALID. "
                 "Provide both a competitor_recipe and a new your_recipe. The competitor_recipe should describe what the observed ad did (3-5 steps). "
                 "The your_recipe must NOT repeat the competitor wording—it should propose new lines, visuals, and reasoning that align with the chosen campaign goal (Lead Generation/Sales/Awareness). "
                 "The JSON must also include keep, avoid, test (lists) and a script object with hook/proof/value/cta strings. "
                 "Use stages Hook, Proof, Value, CTA only. Each competitor step requires timestamp, stage, what, why, formula. Each your step requires timestamp, stage, say, show, why. "
-                "IMPORTANT: competitor_recipe must be a direct array of steps. your_recipe must expose keep, avoid, test, script as direct keys and provide steps in an array under stages or steps, not nested under other wrappers."
+                "IMPORTANT: competitor_recipe must be a direct array of steps. your_recipe must expose keep, avoid, test, script as direct keys and provide steps in an array under stages or steps, not nested under other wrappers. "
+                "All strategic guidance, labels, and instructions in keep/avoid/test must be written in English. Only use Hindi or Hinglish when directly quoting from the ad transcript as an example."
             ),
         },
         {
@@ -348,23 +371,25 @@ def call_ad_strategy_llm(
         },
     ]
 
-    content = _call_chat_completion(messages, response_format={"type": "json_object"})
-    call_ad_strategy_llm.last_raw_response = content
-    call_ad_strategy_llm.last_parse_error = None
-    if not content:
-        call_ad_strategy_llm.last_parse_error = "LLM request failed"
-        return None
-
     try:
-        payload = json.loads(content)
-    except ValueError as exc:
-        call_ad_strategy_llm.last_parse_error = str(exc)
-        return None
+        content = _call_chat_completion(
+            messages, response_format={"type": "json_object"}
+        )
+        call_ad_strategy_llm.last_raw_response = content
+        call_ad_strategy_llm.last_parse_error = None
+        if not content:
+            call_ad_strategy_llm.last_parse_error = "LLM request failed"
+            return None
 
-    normalized, fallback_warning = _normalize_strategy_payload(payload)
-    if fallback_warning:
-        normalized.setdefault("_fallback_warning", fallback_warning)
-    return normalized
+        payload = json.loads(content)
+        normalized, fallback_warning = _normalize_strategy_payload(payload)
+        if fallback_warning:
+            normalized.setdefault("_fallback_warning", fallback_warning)
+        return normalized
+    except Exception as exc:  # pragma: no cover
+        call_ad_strategy_llm.last_parse_error = str(exc)
+        typer.echo(f"Strategy parsing error: {exc}")
+        return None
 
 
 call_ad_strategy_llm.last_raw_response = None
