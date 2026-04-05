@@ -2,9 +2,10 @@ import json
 import os
 import shutil
 import subprocess
-import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+import time
 
 import streamlit as st
 
@@ -12,6 +13,7 @@ st.set_page_config(page_title="FastAds", layout="wide")
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DATA_JOBS_DIR = PROJECT_ROOT / "data" / "jobs"
+UPLOADS_DIR = PROJECT_ROOT / "data" / "ui_uploads"
 
 
 def run_pipeline(input_json_path: Path, competitor: str, market: str = "IN") -> tuple[bool, str]:
@@ -49,6 +51,27 @@ def latest_job_dir() -> Optional[Path]:
     if not jobs:
         return None
     return max(jobs, key=lambda p: p.stat().st_mtime)
+
+
+def prepare_upload_dir() -> None:
+    if UPLOADS_DIR.exists():
+        for child in UPLOADS_DIR.iterdir():
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+    else:
+        UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def latest_job_after(start_ts: float) -> Optional[Path]:
+    if not DATA_JOBS_DIR.exists():
+        return None
+    jobs = sorted([p for p in DATA_JOBS_DIR.iterdir() if p.is_dir()], key=lambda p: p.stat().st_mtime)
+    for job in reversed(jobs):
+        if job.stat().st_mtime >= start_ts:
+            return job
+    return None
 
 
 def load_json(path: Path) -> Optional[Dict[str, Any]]:
@@ -150,25 +173,25 @@ if submitted:
     elif len(uploads) > 3:
         st.error("Upload at most 3 ad videos.")
     else:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmpdir_path = Path(tmpdir)
-            input_items: List[Dict[str, Any]] = []
+        prepare_upload_dir()
+        input_items: List[Dict[str, Any]] = []
 
-            for idx, uploaded in enumerate(uploads, start=1):
-                save_path = tmpdir_path / f"uploaded_ad_{idx}.mp4"
-                save_path.write_bytes(uploaded.getvalue())
-                input_items.append(
-                    {
-                        "ad_id": f"ad_{idx}",
-                        "video_url": "local",
-                        "local_path": str(save_path),
-                        "page_name": competitor,
-                        "ad_copy": uploaded.name,
-                    }
-                )
+        for idx, uploaded in enumerate(uploads, start=1):
+            save_path = UPLOADS_DIR / f"uploaded_ad_{idx}.mp4"
+            save_path.write_bytes(uploaded.getvalue())
+            input_items.append(
+                {
+                    "ad_id": f"ad_{idx}",
+                    "video_url": "local",
+                    "local_path": str(save_path),
+                    "page_name": competitor,
+                    "ad_copy": uploaded.name,
+                }
+            )
 
-            input_json_path = tmpdir_path / "ui_input_ads.json"
-            input_json_path.write_text(json.dumps(input_items, ensure_ascii=False, indent=2), encoding="utf-8")
+        input_json_path = UPLOADS_DIR / "ui_input_ads.json"
+        input_json_path.write_text(json.dumps(input_items, ensure_ascii=False, indent=2), encoding="utf-8")
+        run_start = time.time()
 
             progress = st.status("Starting analysis...", expanded=True)
             progress.write("Uploading files")
@@ -185,10 +208,11 @@ if submitted:
             else:
                 progress.update(label="Analysis complete", state="complete", expanded=False)
                 job_dir = latest_job_dir()
-                if not job_dir:
-                    st.error("No job output found.")
-                else:
-                    ad_results = collect_ad_results(job_dir)
+            job_dir = latest_job_after(run_start)
+            if not job_dir:
+                st.error("No new job output found; pipeline may have failed.")
+            else:
+                ad_results = collect_ad_results(job_dir)
                     if not ad_results:
                         st.error("No ad results found in latest job.")
                     else:
