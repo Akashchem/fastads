@@ -362,6 +362,7 @@ def call_ad_strategy_llm(
                 "The JSON must also include keep, avoid, test (lists) and a script object with hook/proof/value/cta strings. "
                 "Use stages Hook, Proof, Value, CTA only. Each competitor step requires timestamp, stage, what, why, formula. Each your step requires timestamp, stage, say, show, why. "
                 "IMPORTANT: competitor_recipe must be a direct array of steps. your_recipe must expose keep, avoid, test, script as direct keys and provide steps in an array under stages or steps, not nested under other wrappers. "
+                "Each competitor_recipe step MUST include a formula field — a short 3-7 word pattern label describing the technique used, e.g. Pain-stack Hook, Social Proof + Urgency, Feature-drop Proof, Single CTA + Scarcity. Never leave formula empty. "
                 "All strategic guidance, labels, and instructions in keep/avoid/test must be written in English. Only use Hindi or Hinglish when directly quoting from the ad transcript as an example."
             ),
         },
