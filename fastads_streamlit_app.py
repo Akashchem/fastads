@@ -1,13 +1,13 @@
 import json
-import os
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import time
 
 import streamlit as st
+from fastads.providers.llm import call_ad_strategy_llm
 
 st.set_page_config(page_title="FastAds", layout="wide")
 
@@ -44,13 +44,35 @@ def run_pipeline(input_json_path: Path, competitor: str, market: str = "IN") -> 
         return False, f"Failed to run pipeline: {exc}"
 
 
-def latest_job_dir() -> Optional[Path]:
+
+def list_candidate_jobs(start_ts: float) -> List[Tuple[Path, float]]:
     if not DATA_JOBS_DIR.exists():
-        return None
-    jobs = [p for p in DATA_JOBS_DIR.iterdir() if p.is_dir()]
-    if not jobs:
-        return None
-    return max(jobs, key=lambda p: p.stat().st_mtime)
+        return []
+    candidates: List[Tuple[Path, float]] = []
+    for job in DATA_JOBS_DIR.iterdir():
+        if not job.is_dir():
+            continue
+        mtime = job.stat().st_mtime
+        if mtime >= start_ts - 2:
+            candidates.append((job, mtime))
+    return sorted(candidates, key=lambda pair: pair[1], reverse=True)
+
+
+def job_has_expected_output(job_dir: Path, ad_ids: List[str], start_ts: float) -> bool:
+    media_dir = job_dir / "media"
+    if not media_dir.exists():
+        return False
+    for ad_id in ad_ids:
+        ad_dir = media_dir / ad_id
+        if not ad_dir.exists():
+            return False
+        insights_file = ad_dir / "insights.json"
+        transcript_file = ad_dir / "transcript.txt"
+        if not insights_file.exists() or not transcript_file.exists():
+            return False
+        if insights_file.stat().st_mtime < start_ts or transcript_file.stat().st_mtime < start_ts:
+            return False
+    return True
 
 
 def prepare_upload_dir() -> None:
@@ -62,16 +84,6 @@ def prepare_upload_dir() -> None:
                 child.unlink()
     else:
         UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def latest_job_after(start_ts: float) -> Optional[Path]:
-    if not DATA_JOBS_DIR.exists():
-        return None
-    jobs = sorted([p for p in DATA_JOBS_DIR.iterdir() if p.is_dir()], key=lambda p: p.stat().st_mtime)
-    for job in reversed(jobs):
-        if job.stat().st_mtime >= start_ts:
-            return job
-    return None
 
 
 def load_json(path: Path) -> Optional[Dict[str, Any]]:
@@ -149,6 +161,120 @@ def build_pattern_summary(ad_results: List[Dict[str, Any]]) -> Dict[str, Any]:
     return summary
 
 
+def format_flow_segments_for_prompt(segments: List[Dict[str, Any]]) -> str:
+    lines: List[str] = []
+    for seg in segments or []:
+        stage = str(seg.get("stage", "")).strip().capitalize()
+        text = str(seg.get("text", "")).strip()
+        start = seg.get("start")
+        end = seg.get("end")
+        timeframe = ""
+        try:
+            if start is not None and end is not None:
+                timeframe = f"{float(start):.2f}-{float(end):.2f}s"
+            elif start is not None:
+                timeframe = f"{float(start):.2f}s"
+        except (TypeError, ValueError):
+            timeframe = ""
+        entry = f"{stage} {timeframe}: {text}".strip()
+        if entry:
+            lines.append(entry)
+    return " | ".join(lines) if lines else "None"
+
+
+def join_items_for_prompt(items: List[str]) -> str:
+    return "; ".join(filter(None, (it.strip() for it in items))) or "None"
+
+
+def safe_script_value(value: Any) -> str:
+    if not value:
+        return "—"
+    return str(value)
+
+
+def _render_competitor_recipe(steps: List[Dict[str, Any]]) -> None:
+    if not steps:
+        st.info("No competitor recipe steps were detected.")
+        return
+
+    st.write("**Competitor Recipe**")
+    for step in steps:
+        cols = st.columns([1, 1, 2, 2])
+        cols[0].write(safe_script_value(step.get("timestamp")))
+        cols[1].write(safe_script_value(step.get("stage")))
+        cols[2].markdown(
+            f"**What:** {safe_script_value(step.get('what'))}\n"
+            f"**Why:** {safe_script_value(step.get('why'))}"
+        )
+        cols[3].markdown(
+            f"**Formula:** {safe_script_value(step.get('formula'))}"
+        )
+
+
+def _render_your_recipe(steps: List[Dict[str, Any]]) -> None:
+    if not steps:
+        st.info("See Keep/Avoid/Test and Script below for your personalized recommendations.")
+        return
+
+    st.write("**🎬 Your Recipe (Based on Your Goal)**")
+    for step in steps:
+        cols = st.columns([1, 1, 3, 3])
+        cols[0].write(safe_script_value(step.get("timestamp")))
+        cols[1].write(safe_script_value(step.get("stage")))
+        cols[2].markdown(
+            f"**SAY:** {safe_script_value(step.get('say'))}"
+        )
+        cols[3].markdown(
+            f"**SHOW:** {safe_script_value(step.get('show'))}\n**WHY:** {safe_script_value(step.get('why'))}"
+        )
+
+
+
+def build_strategy_display_payload(normalized: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    normalized = normalized or {}
+    return {
+        "competitor_recipe": normalized.get("competitor_recipe", []),
+        "your_recipe": normalized.get("your_recipe", []),
+        "keep": normalized.get("keep", []),
+        "avoid": normalized.get("avoid", []),
+        "test": normalized.get("test", []),
+        "script": normalized.get("script", {}),
+    }
+
+def render_strategy_card(ad_name: str, payload: Dict[str, Any]) -> None:
+    st.markdown(f"#### {ad_name}")
+    st.subheader("Competitor Recipe")
+    _render_competitor_recipe(payload.get("competitor_recipe", []))
+    st.subheader("🎬 Your Recipe (Based on Your Goal)")
+    _render_your_recipe(payload.get("your_recipe", []))
+
+    strategy_sections = [
+        ("Keep", payload.get("keep", [])),
+        ("Avoid", payload.get("avoid", [])),
+        ("Test", payload.get("test", [])),
+    ]
+    columns = st.columns(3)
+    for (label, items), column in zip(strategy_sections, columns):
+        column.write(f"**{label}**")
+        if items:
+            for entry in items:
+                column.write(f"- {entry}")
+        else:
+            column.write("None")
+
+    script = payload.get("script", {})
+    script_columns = st.columns(4)
+    script_labels = [
+        ("hook", "Hook"),
+        ("proof", "Proof"),
+        ("value", "Value"),
+        ("cta", "CTA"),
+    ]
+    for column, (key, label) in zip(script_columns, script_labels):
+        column.write(f"**{label}**")
+        column.write(safe_script_value(script.get(key)))
+
+
 st.title("FastAds")
 st.caption("Analyze competitor ads and turn them into campaign-ready insights.")
 
@@ -179,11 +305,13 @@ if submitted:
         for idx, uploaded in enumerate(uploads, start=1):
             save_path = UPLOADS_DIR / f"uploaded_ad_{idx}.mp4"
             save_path.write_bytes(uploaded.getvalue())
+            absolute_path = str(save_path.resolve())
             input_items.append(
                 {
                     "ad_id": f"ad_{idx}",
-                    "video_url": "local",
-                    "local_path": str(save_path),
+                    "video_url": absolute_path,
+                    "local_path": absolute_path,
+                    "source": "local",
                     "page_name": competitor,
                     "ad_copy": uploaded.name,
                 }
@@ -191,104 +319,179 @@ if submitted:
 
         input_json_path = UPLOADS_DIR / "ui_input_ads.json"
         input_json_path.write_text(json.dumps(input_items, ensure_ascii=False, indent=2), encoding="utf-8")
+        uploaded_names = [uploaded.name for uploaded in uploads]
+        assigned_ad_ids = [item["ad_id"] for item in input_items]
         run_start = time.time()
 
-            progress = st.status("Starting analysis...", expanded=True)
-            progress.write("Uploading files")
-            progress.write("Extracting media")
-            progress.write("Transcribing ad content")
-            progress.write("Analyzing ad structure")
+        progress = st.status("Starting analysis...", expanded=True)
+        progress.write("Uploading files")
+        progress.write("Extracting media")
+        progress.write("Transcribing ad content")
+        progress.write("Analyzing ad structure")
 
-            ok, logs = run_pipeline(input_json_path=input_json_path, competitor=competitor)
+        ok, logs = run_pipeline(input_json_path=input_json_path, competitor=competitor)
 
-            if not ok:
-                progress.update(label="Analysis failed", state="error", expanded=True)
-                st.error("Pipeline failed.")
-                st.code(logs or "No logs available")
+        if not ok:
+            progress.update(label="Analysis failed", state="error", expanded=True)
+            st.error("Pipeline failed.")
+            st.code(logs or "No logs available")
+        else:
+            progress.update(label="Analysis complete", state="complete", expanded=False)
+            candidates = list_candidate_jobs(run_start)
+            candidate_ids = [job.name for job, _ in candidates]
+            selected_job: Optional[Path] = None
+            selected_job_mtime: Optional[float] = None
+            for job, mtime in candidates:
+                if job_has_expected_output(job, assigned_ad_ids, run_start):
+                    selected_job = job
+                    selected_job_mtime = mtime
+                    break
+            if not selected_job:
+                st.error("No fresh job output found for this run. The analysis may have failed.")
             else:
-                progress.update(label="Analysis complete", state="complete", expanded=False)
-                job_dir = latest_job_dir()
-            job_dir = latest_job_after(run_start)
-            if not job_dir:
-                st.error("No new job output found; pipeline may have failed.")
-            else:
+                job_dir = selected_job
                 ad_results = collect_ad_results(job_dir)
-                    if not ad_results:
-                        st.error("No ad results found in latest job.")
-                    else:
-                        st.subheader("Common Patterns Across Ads")
-                        patterns = build_pattern_summary(ad_results)
-                        c1, c2, c3 = st.columns(3)
-                        c1.metric("Ads analyzed", len(ad_results))
-                        c2.metric("Proof before CTA", f"{patterns['proof_before_cta']}/{len(ad_results)}")
-                        c3.metric("CTA present", f"{patterns['cta_present']}/{len(ad_results)}")
+                if not ad_results:
+                    st.error("No ad results found in latest job.")
+                else:
+                    st.subheader("Common Patterns Across Ads")
+                    patterns = build_pattern_summary(ad_results)
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Ads analyzed", len(ad_results))
+                    c2.metric("Proof before CTA", f"{patterns['proof_before_cta']}/{len(ad_results)}")
+                    c3.metric("CTA present", f"{patterns['cta_present']}/{len(ad_results)}")
 
-                        if patterns["flows"]:
-                            common_flow = max(patterns["flows"].items(), key=lambda x: x[1])[0]
-                            st.write(f"**Most common flow:** {common_flow}")
-                            if patterns["proof_before_cta"]:
-                                st.info("Why it matters: competitors are using trust-building proof before asking for action.")
+                    if patterns["flows"]:
+                        common_flow = max(patterns["flows"].items(), key=lambda x: x[1])[0]
+                        st.write(f"**Most common flow:** {common_flow}")
+                        if patterns["proof_before_cta"]:
+                            st.info("Why it matters: competitors are using trust-building proof before asking for action.")
 
-                        if patterns["pain_points"]:
-                            st.write("**Repeated pain points**")
-                            st.write(", ".join([k for k, _ in sorted(patterns["pain_points"].items(), key=lambda x: x[1], reverse=True)[:5]]))
-                        if patterns["value_props"]:
-                            st.write("**Repeated value propositions**")
-                            st.write(", ".join([k for k, _ in sorted(patterns["value_props"].items(), key=lambda x: x[1], reverse=True)[:5]]))
+                    if patterns["pain_points"]:
+                        st.write("**Repeated pain points**")
+                        st.write(", ".join([k for k, _ in sorted(patterns["pain_points"].items(), key=lambda x: x[1], reverse=True)[:5]]))
+                    if patterns["value_props"]:
+                        st.write("**Repeated value propositions**")
+                        st.write(", ".join([k for k, _ in sorted(patterns["value_props"].items(), key=lambda x: x[1], reverse=True)[:5]]))
 
-                        st.subheader("Per-Ad Insights")
-                        for item in ad_results:
-                            insights = item["insights"]
-                            ad_name = insights.get("ad_id", item["ad_id"])
-                            with st.container(border=True):
-                                top1, top2 = st.columns([1, 2])
-                                with top1:
-                                    st.markdown(f"### {ad_name}")
-                                    st.metric("Score", insights.get("ad_score", "N/A"))
-                                with top2:
-                                    st.write(f"**Flow:** {insights.get('primary_structure', 'N/A')}")
-                                    hook = insights.get("hook", {}) or {}
-                                    st.write(f"**Hook:** {hook.get('text', 'N/A')}")
+                    st.subheader("Per-Ad Insights")
+                    for item in ad_results:
+                        insights = item["insights"]
+                        ad_name = insights.get("ad_id", item["ad_id"])
+                        with st.container(border=True):
+                            top1, top2 = st.columns([1, 2])
+                            with top1:
+                                st.markdown(f"### {ad_name}")
+                                st.metric("Score", insights.get("ad_score", "N/A"))
+                            with top2:
+                                st.write(f"**Flow:** {insights.get('primary_structure', 'N/A')}")
+                                hook = insights.get("hook", {}) or {}
+                                st.write(f"**Hook:** {hook.get('text', 'N/A')}")
 
-                                col1, col2 = st.columns(2)
-                                with col1:
-                                    st.write("**Pain points**")
-                                    for txt in flatten_text_items(insights.get("pain_points", [])) or ["None detected"]:
-                                        st.write(f"- {txt}")
+                            col1, col2 = st.columns(2)
+                            with col1:
+                                st.write("**Pain points**")
+                                for txt in flatten_text_items(insights.get("pain_points", [])) or ["None detected"]:
+                                    st.write(f"- {txt}")
 
-                                    st.write("**Proof points**")
-                                    for txt in flatten_text_items(insights.get("proof_points", [])) or ["None detected"]:
-                                        st.write(f"- {txt}")
+                                st.write("**Proof points**")
+                                for txt in flatten_text_items(insights.get("proof_points", [])) or ["None detected"]:
+                                    st.write(f"- {txt}")
 
-                                with col2:
-                                    st.write("**Value propositions**")
-                                    for txt in flatten_text_items(insights.get("value_props", [])) or ["None detected"]:
-                                        st.write(f"- {txt}")
+                            with col2:
+                                st.write("**Value propositions**")
+                                for txt in flatten_text_items(insights.get("value_props", [])) or ["None detected"]:
+                                    st.write(f"- {txt}")
 
-                                    st.write("**CTA**")
-                                    for txt in flatten_text_items(insights.get("ctas", [])) or ["None detected"]:
-                                        st.write(f"- {txt}")
+                                st.write("**CTA**")
+                                for txt in flatten_text_items(insights.get("ctas", [])) or ["None detected"]:
+                                    st.write(f"- {txt}")
 
-                                st.write("**Issues**")
-                                for issue in insights.get("issues", []) or ["No major issues detected"]:
-                                    st.write(f"- {issue}")
+                            st.write("**Issues**")
+                            for issue in insights.get("issues", []) or ["No major issues detected"]:
+                                st.write(f"- {issue}")
 
-                                st.write("**Recommendations**")
-                                for rec in insights.get("recommendations", []) or ["No recommendations available"]:
-                                    st.write(f"- {rec}")
+                            st.write("**Recommendations**")
+                            for rec in insights.get("recommendations", []) or ["No recommendations available"]:
+                                st.write(f"- {rec}")
 
-                                st.write("**Improvements**")
-                                for imp in insights.get("improvements", []) or ["No improvements available"]:
-                                    st.write(f"- {imp}")
+                            st.write("**Improvements**")
+                            for imp in insights.get("improvements", []) or ["No improvements available"]:
+                                st.write(f"- {imp}")
 
-                                with st.expander("Transcript"):
-                                    st.text(item.get("transcript", ""))
-                                with st.expander("OCR text"):
-                                    st.json(item.get("ocr", {}))
-                                with st.expander("Raw JSON"):
-                                    st.json(insights)
+                            with st.expander("Transcript"):
+                                st.text(item.get("transcript", ""))
+                            with st.expander("OCR text"):
+                                st.json(item.get("ocr", {}))
+                            with st.expander("Raw JSON"):
+                                st.json(insights)
 
-                        st.caption(f"Campaign goal selected: {goal}. Goal-based strategy and script generation will be added in the next step.")
+                    st.subheader("Ad Recipe & Strategy")
+                    for item in ad_results:
+                        insights = item["insights"]
+                        ad_name = insights.get("ad_id", item["ad_id"])
+                        ad_flow_text = format_flow_segments_for_prompt(
+                            insights.get("ad_flow", [])
+                        )
+                        pain_text = join_items_for_prompt(
+                            flatten_text_items(insights.get("pain_points", []))
+                        )
+                        proof_text = join_items_for_prompt(
+                            flatten_text_items(insights.get("proof_points", []))
+                        )
+                        value_text = join_items_for_prompt(
+                            flatten_text_items(insights.get("value_props", []))
+                        )
+                        cta_text = join_items_for_prompt(
+                            flatten_text_items(insights.get("ctas", []))
+                        )
 
-                        with st.expander("Pipeline logs"):
-                            st.code(logs or "No logs")
+                        prompt_payload = {
+                            "ad_flow": ad_flow_text,
+                            "pain_points": pain_text,
+                            "proof_points": proof_text,
+                            "value_props": value_text,
+                            "ctas": cta_text,
+                            "goal": goal,
+                        }
+                        with st.expander(f"Strategy prompt payload for {ad_name}"):
+                            st.json(prompt_payload)
+
+                        with st.spinner(f"Crafting strategy for {ad_name}"):
+                            normalized_payload = call_ad_strategy_llm(
+                                ad_flow_text,
+                                pain_text,
+                                proof_text,
+                                value_text,
+                                cta_text,
+                                goal,
+                            )
+
+                        raw_response = getattr(call_ad_strategy_llm, "last_raw_response", None)
+                        parse_error = getattr(call_ad_strategy_llm, "last_parse_error", None)
+                        fallback_warning = (
+                            normalized_payload.get("_fallback_warning")
+                            if normalized_payload
+                            else None
+                        )
+
+                        with st.expander(f"LLM raw response for {ad_name}"):
+                            if raw_response:
+                                st.text(raw_response)
+                            else:
+                                st.text("<no response>")
+                            if parse_error:
+                                st.error(f"Parse error: {parse_error}")
+                            if fallback_warning:
+                                st.info(fallback_warning)
+
+                        strategy_payload = build_strategy_display_payload(normalized_payload)
+                        if not strategy_payload.get("competitor_recipe"):
+                            st.warning(
+                                f"Recipe generation failed for {ad_name}."
+                            )
+                            continue
+                        render_strategy_card(ad_name, strategy_payload)
+
+                    with st.expander("Pipeline logs"):
+                        st.code(logs or "No logs")

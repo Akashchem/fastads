@@ -1,5 +1,6 @@
 import re
 import json
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from openai import AzureOpenAI
@@ -29,20 +30,8 @@ _has_logged_provider = False
 
 
 def classify_segment_with_llm(text: str) -> str | None:
-    global _has_logged_provider
-
     if not FASTADS_LLM_API_KEY or not text.strip():
         return None
-
-    if not _has_logged_provider:
-        if FASTADS_LLM_PROVIDER == "azure_openai":
-            typer.echo("Using LLM provider: azure_openai")
-            typer.echo(f"Using deployment: {AZURE_OPENAI_DEPLOYMENT}")
-        else:
-            typer.echo(
-                f"Using LLM classifier provider={FASTADS_LLM_PROVIDER} model={FASTADS_LLM_MODEL}"
-            )
-        _has_logged_provider = True
 
     messages = [
         {
@@ -76,66 +65,16 @@ def classify_segment_with_llm(text: str) -> str | None:
         },
     ]
 
-    if FASTADS_LLM_PROVIDER == "azure_openai":
-        response = classify_segment_with_azure_openai(messages)
-        return response
-
-    try:
-        with httpx.Client(timeout=20.0) as client:
-            response = client.post(
-                f"{FASTADS_LLM_API_BASE}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {FASTADS_LLM_API_KEY}",
-                    "Content-Type": "application/json",
-                    **provider_headers(),
-                },
-                json={
-                    "model": FASTADS_LLM_MODEL,
-                    "temperature": 0,
-                    "response_format": {"type": "json_object"},
-                    "messages": messages,
-                },
-            )
-            response.raise_for_status()
-    except httpx.HTTPError:
+    content = _call_chat_completion(messages, response_format={"type": "json_object"})
+    if not content:
         return None
 
-    try:
-        payload = response.json()
-    except ValueError:
-        return None
-
-    content = payload.get("choices", [{}])[0].get("message", {}).get("content", "")
     return parse_llm_output(content)
 
 
 def classify_segment_with_azure_openai(messages: list[dict[str, str]]) -> str | None:
-    if (
-        not AZURE_OPENAI_API_KEY
-        or not AZURE_OPENAI_ENDPOINT
-        or not AZURE_OPENAI_API_VERSION
-        or not AZURE_OPENAI_DEPLOYMENT
-    ):
-        return None
-
-    try:
-        client = AzureOpenAI(
-            api_key=AZURE_OPENAI_API_KEY,
-            azure_endpoint=AZURE_OPENAI_ENDPOINT,
-            api_version=AZURE_OPENAI_API_VERSION,
-        )
-        response = client.chat.completions.create(
-            model=AZURE_OPENAI_DEPLOYMENT,
-            messages=messages,
-            max_completion_tokens=2048,
-            response_format={"type": "json_object"},  # ADD THIS
-
-        )
-    except Exception:
-        return None
-
-    content = response.choices[0].message.content or ""
-    return parse_llm_output(content)
+    # kept for backward compatibility
+    return None
 
 
 def parse_llm_output(content: str) -> dict[str, object] | None:
@@ -172,6 +111,229 @@ def provider_headers() -> dict[str, str]:
         "HTTP-Referer": "https://github.com/Akashchem/fastads",
         "X-Title": "FastAds",
     }
+
+
+def _ensure_provider_logged() -> None:
+    global _has_logged_provider
+    if _has_logged_provider:
+        return
+
+    if FASTADS_LLM_PROVIDER == "azure_openai":
+        typer.echo("Using LLM provider: azure_openai")
+        typer.echo(f"Using deployment: {AZURE_OPENAI_DEPLOYMENT}")
+    else:
+        typer.echo(
+            f"Using LLM classifier provider={FASTADS_LLM_PROVIDER} model={FASTADS_LLM_MODEL}"
+        )
+
+    _has_logged_provider = True
+
+
+def _call_chat_completion(
+    messages: list[dict[str, str]], response_format: dict | None = None
+) -> str | None:
+    if not FASTADS_LLM_API_KEY:
+        return None
+
+    _ensure_provider_logged()
+
+    if FASTADS_LLM_PROVIDER == "azure_openai":
+        if (
+            not AZURE_OPENAI_API_KEY
+            or not AZURE_OPENAI_ENDPOINT
+            or not AZURE_OPENAI_API_VERSION
+            or not AZURE_OPENAI_DEPLOYMENT
+        ):
+            return None
+
+        try:
+            client = AzureOpenAI(
+                api_key=AZURE_OPENAI_API_KEY,
+                azure_endpoint=AZURE_OPENAI_ENDPOINT,
+                api_version=AZURE_OPENAI_API_VERSION,
+            )
+            kwargs = {
+                "model": AZURE_OPENAI_DEPLOYMENT,
+                "messages": messages,
+                "max_completion_tokens": 2048,
+            }
+            if response_format:
+                kwargs["response_format"] = response_format
+            response = client.chat.completions.create(**kwargs)
+        except Exception:
+            return None
+
+        return response.choices[0].message.content or ""
+
+    try:
+        with httpx.Client(timeout=20.0) as client:
+            payload = {
+                "model": FASTADS_LLM_MODEL,
+                "temperature": 0,
+                "messages": messages,
+            }
+            if response_format:
+                payload["response_format"] = response_format
+            response = client.post(
+                f"{FASTADS_LLM_API_BASE}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {FASTADS_LLM_API_KEY}",
+                    "Content-Type": "application/json",
+                    **provider_headers(),
+                },
+                json=payload,
+            )
+            response.raise_for_status()
+    except httpx.HTTPError:
+        return None
+
+    try:
+        payload = response.json()
+    except ValueError:
+        return None
+
+    return payload.get("choices", [{}])[0].get("message", {}).get("content", "")
+
+
+def _coerce_steps(raw: Any, allowed_keys: Tuple[str, ...], allowed_stages: set[str]) -> List[Dict[str, str]]:
+    normalized: List[Dict[str, str]] = []
+    if isinstance(raw, list):
+        for entry in raw:
+            if len(normalized) >= 5:
+                break
+            if not isinstance(entry, dict):
+                continue
+            stage = str(entry.get("stage", "")).strip()
+            if stage and stage not in allowed_stages:
+                continue
+            normalized.append({key: str(entry.get(key, "")).strip() for key in allowed_keys})
+    return normalized
+
+
+def _normalize_strategy_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], Optional[str]]:
+    allowed = {"Hook", "Proof", "Value", "CTA"}
+    competitor_keys = ("timestamp", "stage", "what", "why", "formula")
+    competitor_steps = _coerce_steps(payload.get("competitor_recipe"), competitor_keys, allowed)
+    fallback_warning: Optional[str] = None
+    if not competitor_steps:
+        competitor_steps = _coerce_steps(payload.get("recipe"), competitor_keys, allowed)
+    if not competitor_steps and isinstance(payload.get("steps"), list):
+        competitor_steps = _coerce_steps(payload.get("steps"), competitor_keys, allowed)
+        if competitor_steps:
+            fallback_warning = "Converted legacy 'steps' schema for competitor_recipe."
+
+    your_keys = ("timestamp", "stage", "say", "show", "why")
+    your_raw = payload.get("your_recipe")
+    your_steps: List[Dict[str, str]] = []
+    if isinstance(your_raw, dict):
+        your_steps = _coerce_steps(your_raw.get("steps") or your_raw.get("recipe"), your_keys, allowed)
+    else:
+        your_steps = _coerce_steps(your_raw, your_keys, allowed)
+
+    def _ensure_list(key: str) -> List[str]:
+        source = None
+        if isinstance(your_raw, dict):
+            source = your_raw.get(key)
+        if source is None:
+            source = payload.get(key)
+        if isinstance(source, list):
+            return [str(item).strip() for item in source if str(item).strip()]
+        if isinstance(source, str) and source.strip():
+            return [source.strip()]
+        return []
+
+    script_source = None
+    if isinstance(your_raw, dict):
+        script_source = your_raw.get("script")
+    if script_source is None:
+        script_source = payload.get("script") or {}
+
+    def _script_value(key: str) -> str:
+        if not script_source:
+            return ""
+        value = script_source.get(key)
+        if value:
+            return str(value).strip()
+        alternate = script_source.get(key.capitalize())
+        if alternate:
+            return str(alternate).strip()
+        return ""
+
+    normalized_script = {
+        "hook": _script_value("hook"),
+        "proof": _script_value("proof"),
+        "value": _script_value("value"),
+        "cta": _script_value("cta"),
+    }
+
+    return {
+        "competitor_recipe": competitor_steps,
+        "your_recipe": your_steps,
+        "keep": _ensure_list("keep"),
+        "avoid": _ensure_list("avoid"),
+        "test": _ensure_list("test"),
+        "script": normalized_script,
+    }, fallback_warning
+
+
+def call_ad_strategy_llm(
+    ad_flow: str,
+    pain_points: str,
+    proof_points: str,
+    value_props: str,
+    ctas: str,
+    goal: str,
+) -> Optional[dict[str, Any]]:
+    if not FASTADS_LLM_API_KEY:
+        return None
+
+    prompt = (
+        f"Ad flow: {ad_flow}\n"
+        f"Pain points: {pain_points}\n"
+        f"Proof points: {proof_points}\n"
+        f"Value props: {value_props}\n"
+        f"CTAs: {ctas}\n"
+        f"Campaign goal: {goal}"
+    )
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a creative strategist writing marketing playbooks. Return ONLY valid JSON. "
+                "Provide both a competitor_recipe and a new your_recipe. The competitor_recipe should describe what the observed ad did (3-5 steps). "
+                "The your_recipe must NOT repeat the competitor wording—it should propose new lines, visuals, and reasoning that align with the chosen campaign goal (Lead Generation/Sales/Awareness). "
+                "The JSON must also include keep, avoid, test (lists) and a script object with hook/proof/value/cta strings. "
+                "Use stages Hook, Proof, Value, CTA only. Each competitor step requires timestamp, stage, what, why, formula. Each your step requires timestamp, stage, say, show, why."
+            ),
+        },
+        {
+            "role": "user",
+            "content": prompt,
+        },
+    ]
+
+    content = _call_chat_completion(messages, response_format={"type": "json_object"})
+    call_ad_strategy_llm.last_raw_response = content
+    call_ad_strategy_llm.last_parse_error = None
+    if not content:
+        call_ad_strategy_llm.last_parse_error = "LLM request failed"
+        return None
+
+    try:
+        payload = json.loads(content)
+    except ValueError as exc:
+        call_ad_strategy_llm.last_parse_error = str(exc)
+        return None
+
+    normalized, fallback_warning = _normalize_strategy_payload(payload)
+    if fallback_warning:
+        normalized.setdefault("_fallback_warning", fallback_warning)
+    return normalized
+
+
+call_ad_strategy_llm.last_raw_response = None
+call_ad_strategy_llm.last_parse_error = None
 
 
 def extract_label(content: str) -> str | None:
