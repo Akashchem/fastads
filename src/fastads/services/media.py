@@ -4,6 +4,7 @@ import json
 import re
 import shutil
 import subprocess
+from typing import Any
 from urllib import error, request
 
 import httpx
@@ -50,19 +51,20 @@ def prepare_media(job_dir: str) -> int:
 
         ad_id = item.get("ad_id")
         video_url = item.get("video_url")
+        local_path = item.get("local_path")
         if not ad_id or not video_url:
             continue
 
         media_dir = job_path / "media" / str(ad_id)
         media_dir.mkdir(parents=True, exist_ok=True)
-        write_json(
-            media_dir / "media_meta.json",
-            {
-                "ad_id": str(ad_id),
-                "video_url": str(video_url),
-                "status": "pending_download",
-            },
-        )
+        meta: dict[str, Any] = {
+            "ad_id": str(ad_id),
+            "video_url": str(video_url),
+            "status": "pending_download",
+        }
+        if local_path:
+            meta["local_path"] = str(local_path)
+        write_json(media_dir / "media_meta.json", meta)
         prepared_count += 1
 
     typer.echo(f"Prepared media for {prepared_count} ads")
@@ -94,9 +96,21 @@ def download_media(job_dir: str) -> tuple[int, int]:
             continue
 
         video_url = media_meta.get("video_url")
+        local_path = media_meta.get("local_path")
         local_video_path = media_dir / "source.mp4"
         media_dir.mkdir(parents=True, exist_ok=True)
         download_error: str | None = None
+
+        if local_path:
+            local_source = Path(local_path)
+            if local_source.exists():
+                shutil.copy(local_source, local_video_path)
+                media_meta["status"] = "downloaded"
+                media_meta["local_video_path"] = "source.mp4"
+                media_meta.pop("error", None)
+                write_json(media_meta_path, media_meta)
+                downloaded_count += 1
+                continue
 
         if video_url:
             try:

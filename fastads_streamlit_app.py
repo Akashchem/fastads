@@ -192,6 +192,20 @@ def safe_script_value(value: Any) -> str:
     return str(value)
 
 
+def _get_script_value(script: Dict[str, Any], keys: List[str]) -> str:
+    for key in keys:
+        value = script.get(key)
+        if value:
+            return safe_script_value(value)
+        capitalized = script.get(key.capitalize())
+        if capitalized:
+            return safe_script_value(capitalized)
+        upper = script.get(key.upper())
+        if upper:
+            return safe_script_value(upper)
+    return "—"
+
+
 def _render_competitor_recipe(steps: List[Dict[str, Any]]) -> None:
     if not steps:
         st.info("No competitor recipe steps were detected.")
@@ -211,6 +225,14 @@ def _render_competitor_recipe(steps: List[Dict[str, Any]]) -> None:
         )
 
 
+def _get_step_field(step: Dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = step.get(key)
+        if value:
+            return str(value).strip()
+    return ""
+
+
 def _render_your_recipe(steps: List[Dict[str, Any]]) -> None:
     if not steps:
         st.info("See Keep/Avoid/Test and Script below for your personalized recommendations.")
@@ -219,34 +241,98 @@ def _render_your_recipe(steps: List[Dict[str, Any]]) -> None:
     st.write("**🎬 Your Recipe (Based on Your Goal)**")
     for step in steps:
         cols = st.columns([1, 1, 3, 3])
-        cols[0].write(safe_script_value(step.get("timestamp")))
-        cols[1].write(safe_script_value(step.get("stage")))
+        cols[0].write(safe_script_value(_get_step_field(step, "timestamp", "time")))
+        cols[1].write(safe_script_value(_get_step_field(step, "stage", "Stage")))
         cols[2].markdown(
-            f"**SAY:** {safe_script_value(step.get('say'))}"
+            f"**SAY:** {safe_script_value(_get_step_field(step, 'say', 'SAY'))}"
         )
         cols[3].markdown(
-            f"**SHOW:** {safe_script_value(step.get('show'))}\n**WHY:** {safe_script_value(step.get('why'))}"
+            f"**SHOW:** {safe_script_value(_get_step_field(step, 'show', 'SHOW'))}\n"
+            f"**WHY:** {safe_script_value(_get_step_field(step, 'why', 'WHY'))}"
         )
 
 
 
 def build_strategy_display_payload(normalized: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     normalized = normalized or {}
+    raw_your_recipe = normalized.get("your_recipe", {})
+    your_recipe_steps: List[Dict[str, Any]] = []
+    if isinstance(raw_your_recipe, dict):
+        stages = raw_your_recipe.get("stages")
+        steps = raw_your_recipe.get("steps")
+        if isinstance(stages, list):
+            your_recipe_steps = stages
+        elif isinstance(steps, list):
+            your_recipe_steps = steps
+    elif isinstance(raw_your_recipe, list):
+        your_recipe_steps = raw_your_recipe
+
+    script_source = {}
+    if isinstance(raw_your_recipe, dict):
+        script_source = raw_your_recipe.get("script", {})
+    if not script_source:
+        script_source = normalized.get("script", {})
+
+    raw_competitor_recipe = normalized.get("competitor_recipe", [])
+    competitor_steps: List[Dict[str, Any]] = []
+    if isinstance(raw_competitor_recipe, dict):
+        competitor_steps = raw_competitor_recipe.get("steps", [])
+    elif isinstance(raw_competitor_recipe, list):
+        competitor_steps = raw_competitor_recipe
+    if not isinstance(competitor_steps, list):
+        competitor_steps = []
+
     return {
-        "competitor_recipe": normalized.get("competitor_recipe", []),
-        "your_recipe": normalized.get("your_recipe", []),
-        "keep": normalized.get("keep", []),
-        "avoid": normalized.get("avoid", []),
-        "test": normalized.get("test", []),
-        "script": normalized.get("script", {}),
+        "competitor_recipe": competitor_steps,
+        "your_recipe_steps": your_recipe_steps,
+        "keep": raw_your_recipe.get("keep")
+        if isinstance(raw_your_recipe, dict)
+        else normalized.get("keep", []),
+        "avoid": raw_your_recipe.get("avoid")
+        if isinstance(raw_your_recipe, dict)
+        else normalized.get("avoid", []),
+        "test": raw_your_recipe.get("test")
+        if isinstance(raw_your_recipe, dict)
+        else normalized.get("test", []),
+        "script": script_source,
     }
+
+
+def _copy_script_line(ad_name: str, label: str, text: str) -> None:
+    if not text:
+        st.warning(f"No {label} copyable content.")
+        return
+    st.session_state[f"clipboard-{ad_name}-{label}"] = text
+    st.success(f"Copied {label} for {ad_name}.")
+
+
+def _render_script_block(script: Dict[str, Any], ad_name: str) -> None:
+    st.write("**Script**")
+    script_columns = st.columns(4)
+    script_labels = [
+        ("hook", "Hook"),
+        ("proof", "Proof"),
+        ("value", "Value"),
+        ("cta", "CTA"),
+    ]
+    for column, (key, label) in zip(script_columns, script_labels):
+        text = _get_script_value(script, [key, key.upper()])
+        column.write(f"**{label}**")
+        column.code(text)
+        column.button(
+            f"Copy {label}",
+            key=f"copy-{ad_name}-{label}",
+            on_click=_copy_script_line,
+            args=(ad_name, label, text),
+        )
 
 def render_strategy_card(ad_name: str, payload: Dict[str, Any]) -> None:
     st.markdown(f"#### {ad_name}")
     st.subheader("Competitor Recipe")
     _render_competitor_recipe(payload.get("competitor_recipe", []))
     st.subheader("🎬 Your Recipe (Based on Your Goal)")
-    _render_your_recipe(payload.get("your_recipe", []))
+    script = payload.get("script", {})
+    _render_script_block(script, ad_name)
 
     strategy_sections = [
         ("Keep", payload.get("keep", [])),
@@ -262,21 +348,11 @@ def render_strategy_card(ad_name: str, payload: Dict[str, Any]) -> None:
         else:
             column.write("None")
 
-    script = payload.get("script", {})
-    script_columns = st.columns(4)
-    script_labels = [
-        ("hook", "Hook"),
-        ("proof", "Proof"),
-        ("value", "Value"),
-        ("cta", "CTA"),
-    ]
-    for column, (key, label) in zip(script_columns, script_labels):
-        column.write(f"**{label}**")
-        column.write(safe_script_value(script.get(key)))
+    _render_your_recipe(payload.get("your_recipe_steps", []))
 
 
 st.title("FastAds")
-st.caption("Analyze competitor ads and turn them into campaign-ready insights.")
+st.caption("Upload a competitor ad. Get the recipe to beat it.")
 
 with st.form("fastads_input_form"):
     uploads = st.file_uploader(

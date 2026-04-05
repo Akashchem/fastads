@@ -1,3 +1,5 @@
+from typing import Optional
+
 from pydantic import BaseModel
 
 
@@ -13,3 +15,4 @@ class NormalizedAd(BaseModel):
     page_name: str
     ad_copy: str
     video_url: str
+    local_path: Optional[str] = None

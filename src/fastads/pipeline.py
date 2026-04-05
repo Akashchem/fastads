@@ -80,6 +80,7 @@ def ingest_ads(input_path: str, job_dir: str) -> list[dict]:
             page_name=str(item["page_name"]),
             ad_copy=str(item["ad_copy"]),
             video_url=str(item["video_url"]),
+            local_path=str(item.get("local_path")) if item.get("local_path") else None,
         )
         normalized_ads.append(normalized_ad.model_dump())
 

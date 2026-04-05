@@ -213,7 +213,26 @@ def _coerce_steps(raw: Any, allowed_keys: Tuple[str, ...], allowed_stages: set[s
 def _normalize_strategy_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], Optional[str]]:
     allowed = {"Hook", "Proof", "Value", "CTA"}
     competitor_keys = ("timestamp", "stage", "what", "why", "formula")
-    competitor_steps = _coerce_steps(payload.get("competitor_recipe"), competitor_keys, allowed)
+    def _extract_competitor(raw: Any) -> Optional[Any]:
+        if isinstance(raw, list):
+            return raw
+        if isinstance(raw, dict):
+            for key in ("steps", "what_we_observed", "observations"):
+                candidate = raw.get(key)
+                if isinstance(candidate, list):
+                    return candidate
+            # Some payloads put steps under a nested key
+            for parent in ("plan", "manifest", "structure"):
+                child = raw.get(parent)
+                if isinstance(child, dict):
+                    for key in ("steps", "what_we_observed", "observations"):
+                        candidate = child.get(key)
+                        if isinstance(candidate, list):
+                            return candidate
+        return None
+
+    competitor_raw = _extract_competitor(payload.get("competitor_recipe")) or payload.get("competitor_recipe")
+    competitor_steps = _coerce_steps(competitor_raw, competitor_keys, allowed)
     fallback_warning: Optional[str] = None
     if not competitor_steps:
         competitor_steps = _coerce_steps(payload.get("recipe"), competitor_keys, allowed)
@@ -224,11 +243,28 @@ def _normalize_strategy_payload(payload: dict[str, Any]) -> tuple[dict[str, Any]
 
     your_keys = ("timestamp", "stage", "say", "show", "why")
     your_raw = payload.get("your_recipe")
-    your_steps: List[Dict[str, str]] = []
-    if isinstance(your_raw, dict):
-        your_steps = _coerce_steps(your_raw.get("steps") or your_raw.get("recipe"), your_keys, allowed)
-    else:
+    def _extract_your(raw: Any) -> Optional[Any]:
+        if isinstance(raw, list):
+            return raw
+        if isinstance(raw, dict):
+            for key in ("stages", "steps", "recipe"):
+                candidate = raw.get(key)
+                if isinstance(candidate, list):
+                    return candidate
+            for parent in ("plan", "goal", "approach"):
+                nested = raw.get(parent)
+                if isinstance(nested, dict):
+                    for key in ("stages", "steps", "recipe"):
+                        candidate = nested.get(key)
+                        if isinstance(candidate, list):
+                            return candidate
+        return None
+
+    your_steps = _coerce_steps(_extract_your(your_raw), your_keys, allowed)
+    if not your_steps and isinstance(your_raw, list):
         your_steps = _coerce_steps(your_raw, your_keys, allowed)
+    if not your_steps:
+        your_steps = _coerce_steps(None, your_keys, allowed)
 
     def _ensure_list(key: str) -> List[str]:
         source = None
@@ -251,12 +287,10 @@ def _normalize_strategy_payload(payload: dict[str, Any]) -> tuple[dict[str, Any]
     def _script_value(key: str) -> str:
         if not script_source:
             return ""
-        value = script_source.get(key)
-        if value:
-            return str(value).strip()
-        alternate = script_source.get(key.capitalize())
-        if alternate:
-            return str(alternate).strip()
+        for candidate in (key, key.capitalize(), key.upper()):
+            value = script_source.get(candidate)
+            if value:
+                return str(value).strip()
         return ""
 
     normalized_script = {
@@ -304,7 +338,8 @@ def call_ad_strategy_llm(
                 "Provide both a competitor_recipe and a new your_recipe. The competitor_recipe should describe what the observed ad did (3-5 steps). "
                 "The your_recipe must NOT repeat the competitor wording—it should propose new lines, visuals, and reasoning that align with the chosen campaign goal (Lead Generation/Sales/Awareness). "
                 "The JSON must also include keep, avoid, test (lists) and a script object with hook/proof/value/cta strings. "
-                "Use stages Hook, Proof, Value, CTA only. Each competitor step requires timestamp, stage, what, why, formula. Each your step requires timestamp, stage, say, show, why."
+                "Use stages Hook, Proof, Value, CTA only. Each competitor step requires timestamp, stage, what, why, formula. Each your step requires timestamp, stage, say, show, why. "
+                "IMPORTANT: competitor_recipe must be a direct array of steps. your_recipe must expose keep, avoid, test, script as direct keys and provide steps in an array under stages or steps, not nested under other wrappers."
             ),
         },
         {
