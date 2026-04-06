@@ -260,9 +260,19 @@ def build_strategy_display_payload(normalized: Optional[Dict[str, Any]]) -> Dict
         script_source = normalized.get("script", {}) or {}
 
     script_stages: List[Dict[str, Any]] = []
-    for source in (script_source, raw_your_recipe if isinstance(raw_your_recipe, dict) else {}):
+    candidate_sources: List[Any] = []
+    if isinstance(raw_your_recipe, dict):
+        candidate_sources.append(raw_your_recipe)
+    raw_competitor_recipe = normalized.get("competitor_recipe", {})
+    if isinstance(raw_competitor_recipe, dict):
+        candidate_sources.append(raw_competitor_recipe)
+    candidate_sources.append(script_source)
+
+    for source in candidate_sources:
+        if not isinstance(source, dict):
+            continue
         for key in ("stages", "steps"):
-            candidate = source.get(key) if isinstance(source, dict) else None
+            candidate = source.get(key)
             if isinstance(candidate, list):
                 script_stages = candidate
                 break
