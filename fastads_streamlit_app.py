@@ -254,13 +254,21 @@ def build_strategy_display_payload(normalized: Optional[Dict[str, Any]]) -> Dict
     raw_your_recipe = normalized.get("your_recipe", {})
     your_recipe_steps: List[Dict[str, Any]] = []
     script_source: Dict[str, Any] = {}
+    if isinstance(raw_your_recipe, dict):
+        script_source = raw_your_recipe.get("script", {}) or {}
+    if not script_source:
+        script_source = normalized.get("script", {}) or {}
+
     script_stages: List[Dict[str, Any]] = []
-    if isinstance(script_source, dict):
+    for source in (script_source, raw_your_recipe if isinstance(raw_your_recipe, dict) else {}):
         for key in ("stages", "steps"):
-            candidate = script_source.get(key)
+            candidate = source.get(key) if isinstance(source, dict) else None
             if isinstance(candidate, list):
                 script_stages = candidate
                 break
+        if script_stages:
+            break
+
     if script_stages:
         your_recipe_steps = script_stages
     elif isinstance(raw_your_recipe, dict):
@@ -274,12 +282,6 @@ def build_strategy_display_payload(normalized: Optional[Dict[str, Any]]) -> Dict
             your_recipe_steps = []
     elif isinstance(raw_your_recipe, list):
         your_recipe_steps = raw_your_recipe
-
-    script_source = {}
-    if isinstance(raw_your_recipe, dict):
-        script_source = raw_your_recipe.get("script", {})
-    if not script_source:
-        script_source = normalized.get("script", {})
 
     raw_competitor_recipe = normalized.get("competitor_recipe", [])
     competitor_steps: List[Dict[str, Any]] = []
