@@ -279,10 +279,7 @@ def transcribe_media(job_dir: str) -> int:
     model_error: str | None = None
 
     if FASTADS_TRANSCRIBER == "local":
-        try:
-            model = WhisperModel("small")
-        except Exception as exc:
-            model_error = str(exc)
+        model, model_error = load_local_transcriber_model()
 
     for media_dir in sorted(path for path in media_root.iterdir() if path.is_dir()):
         audio_path = media_dir / "audio.wav"
@@ -304,13 +301,33 @@ def transcribe_media(job_dir: str) -> int:
                 model_error=model_error,
             )
         except Exception as exc:
-            media_meta["transcription_error"] = str(exc)
-            write_json(media_meta_path, media_meta)
             if FASTADS_TRANSCRIBER == "remote":
-                typer.echo(f"Error: remote transcription failed for {audio_path}: {exc}", err=True)
-                raise typer.Exit(code=1) from exc
-            failed_count += 1
-            continue
+                typer.echo(
+                    f"Warning: remote transcription failed for {audio_path}: {exc}",
+                    err=True,
+                )
+                if model is None and model_error is None:
+                    model, model_error = load_local_transcriber_model()
+                try:
+                    transcript_text, segment_payload = transcribe_audio_file_local(
+                        audio_path=audio_path,
+                        model=model,
+                        model_error=model_error,
+                    )
+                    media_meta["transcriber_fallback"] = "local"
+                except Exception as fallback_exc:
+                    media_meta["transcription_error"] = str(fallback_exc)
+                    write_json(media_meta_path, media_meta)
+                    typer.echo(
+                        f"Error: remote transcription fallback failed for {audio_path}: {fallback_exc}",
+                        err=True,
+                    )
+                    raise typer.Exit(code=1) from fallback_exc
+            else:
+                media_meta["transcription_error"] = str(exc)
+                write_json(media_meta_path, media_meta)
+                failed_count += 1
+                continue
 
         transcript_path.write_text(transcript_text, encoding="utf-8")
         transcript_segments_path.write_text(
@@ -367,6 +384,13 @@ def transcribe_audio_file_local(
     return transcript_text, segment_payload
 
 
+def load_local_transcriber_model() -> tuple[WhisperModel | None, str | None]:
+    try:
+        return WhisperModel("small"), None
+    except Exception as exc:
+        return None, str(exc)
+
+
 def transcribe_audio_file_remote(
     audio_path: Path,
 ) -> tuple[str, list[dict[str, str | float]]]:
@@ -387,12 +411,24 @@ def transcribe_audio_file_remote(
         "model": WHISPER_MODEL,
         "response_format": WHISPER_RESPONSE_FORMAT,
     }
-    response = httpx.post(
-        WHISPER_API_URL,
-        headers=headers,
-        json=payload,
-        timeout=120,
-    )
+    timeout = httpx.Timeout(300.0, connect=30.0)
+    last_error: Exception | None = None
+    response: httpx.Response | None = None
+
+    for _attempt in range(2):
+        try:
+            response = httpx.post(
+                WHISPER_API_URL,
+                headers=headers,
+                json=payload,
+                timeout=timeout,
+            )
+            break
+        except httpx.TimeoutException as exc:
+            last_error = exc
+
+    if response is None:
+        raise RuntimeError(f"Remote transcription request timed out: {last_error}")
 
     response.raise_for_status()
     payload = response.json()
@@ -595,173 +631,309 @@ def analyze_transcript(job_dir: str) -> int:
             if isinstance(segment, dict) and str(segment.get("text", "")).strip()
         ]
         if not normalized_segments:
+            ocr_path = media_dir / "ocr.json"
+            ocr_entries = read_json(ocr_path) if ocr_path.exists() else []
+            visual_segments = (
+                build_visual_segments_from_ocr(ocr_entries)
+                if isinstance(ocr_entries, list)
+                else []
+            )
+            if is_visual_signal_strong(visual_segments):
+                insights = build_insights_from_segments(
+                    ad_id=ad_id,
+                    normalized_segments=visual_segments,
+                    use_llm=False,
+                    analysis_mode="visual_only",
+                    confidence="medium",
+                )
+                write_json(insights_path, insights)
+                media_meta["insights_path"] = "insights.json"
+                media_meta["analysis_mode"] = "visual_only"
+                media_meta["analysis_status"] = "completed"
+                media_meta["confidence"] = "medium"
+                write_json(media_meta_path, media_meta)
+                print_ad_summary(
+                    ad_id=ad_id,
+                    ad_score=int(insights["ad_score"]),
+                    primary_structure=str(insights["primary_structure"]),
+                    hook=insights["hook"],
+                    proof_points=insights["proof_points"],
+                    value_props=insights["value_props"],
+                    ctas=insights["ctas"],
+                    offers=insights["offers"],
+                    first_cta_time=insights["first_cta_time"],
+                    improvements=insights["improvements"],
+                )
+                analyzed_count += 1
+            else:
+                media_meta["analysis_status"] = "no_signal"
+                media_meta.pop("analysis_mode", None)
+                media_meta.pop("confidence", None)
+                write_json(media_meta_path, media_meta)
             continue
 
-        full_text = " ".join(segment["text"] for segment in normalized_segments)
-        language = "hindi_or_hinglish" if has_devanagari(full_text) else "english"
-
-        aggregated_signals = {
-            "value_props": [],
-            "offers": [],
-            "pain_points": [],
-            "proof_points": [],
-        }
-        ctas: list[dict[str, str | float]] = []
-        ad_flow: list[dict[str, str | float]] = []
-        hook_segment: dict[str, str | float] | None = None
-
-        for index, segment in enumerate(normalized_segments):
-            llm_response = classify_segment_with_llm(segment["text"])
-            flow_label = llm_response.get("flow_label") if isinstance(llm_response, dict) else None
-            extracted = llm_response.get("extracted", {}) if isinstance(llm_response, dict) else {}
-            ensure_extracted_defaults(extracted)
-            add_heuristic_extraction(segment["text"], extracted)
-            debug_segment_outputs(segment["text"], flow_label, extracted)
-            stage = choose_segment_stage(
-                str(segment["text"]),
-                is_first=index == 0,
-                llm_flow=flow_label,
-            )
-            block = {
-                "text": segment["text"],
-                "start": segment["start"],
-                "end": segment["end"],
-            }
-
-            if stage == "hook":
-                hook_segment = hook_segment or block
-            elif stage == "pain_point":
-                pass
-            elif stage == "value_prop":
-                pass
-            elif stage == "offer":
-                pass
-            elif stage == "cta":
-                ctas.append(block)
-            elif stage == "proof":
-                pass
-
-            ad_flow.append(
-                {
-                    "stage": stage,
-                    "text": segment["text"],
-                    "start": segment["start"],
-                    "end": segment["end"],
-                }
-            )
-            add_extracted_signals(aggregated_signals, extracted, segment)
-
-        if hook_segment is None:
-            first_segment = normalized_segments[0]
-            hook_segment = {
-                "text": first_segment["text"],
-                "type": "generic",
-                "start": first_segment["start"],
-                "end": first_segment["end"],
-            }
-        else:
-            hook_segment = {
-                "text": hook_segment["text"],
-                "type": classify_hook_type(str(hook_segment["text"])),
-                "start": hook_segment["start"],
-                "end": hook_segment["end"],
-            }
-
-        summary_segments = [
-            segment["text"]
-            for segment in normalized_segments
-            if is_meaningful_text(segment["text"])
-        ][:3]
-        summary = " ".join(summary_segments).strip()
-        pain_points = aggregated_signals["pain_points"]
-        value_props = aggregated_signals["value_props"]
-        proof_points = aggregated_signals["proof_points"]
-        offers = aggregated_signals["offers"]
-        first_pain_time = first_stage_time(pain_points)
-        first_value_time = first_stage_time(value_props)
-        first_proof_time = first_stage_time(proof_points)
-        first_offer_time = first_stage_time(offers)
-        first_cta_time = first_stage_time(ctas)
-        structure_labels = {
-            "pain_before_value": compare_stage_times(first_pain_time, first_value_time),
-            "proof_before_cta": compare_stage_times(first_proof_time, first_cta_time),
-            "cta_after_value": compare_stage_times(first_value_time, first_cta_time),
-            "cta_before_value": compare_stage_times(first_cta_time, first_value_time),
-            "offer_before_cta": compare_stage_times(first_offer_time, first_cta_time),
-        }
-        issues, recommendations = build_issues_and_recommendations(
-            hook=hook_segment,
-            offers=offers,
-            proof_points=proof_points,
-            first_cta_time=first_cta_time,
-            first_value_time=first_value_time,
-            cta_count=len(ctas),
+        insights = build_insights_from_segments(
+            ad_id=ad_id,
+            normalized_segments=normalized_segments,
+            use_llm=True,
+            analysis_mode="transcript",
+            confidence="high",
         )
-        improvements = build_improvements(
-            hook=hook_segment,
-            offers=offers,
-            value_props=value_props,
-            ctas=ctas,
-            proof_points=proof_points,
-            cta_before_value=structure_labels["cta_before_value"],
-        )
-        score_payload = build_ad_scores(
-            hook=hook_segment,
-            proof_points=proof_points,
-            value_props=value_props,
-            ctas=ctas,
-            offers=offers,
-            cta_before_value=structure_labels["cta_before_value"],
-        )
-
-        insights = {
-            "ad_id": ad_id,
-            "language": language,
-            "pain_points": pain_points,
-            "summary": summary,
-            "hook": hook_segment,
-            "value_props": value_props,
-            "offers": offers,
-            "ctas": ctas,
-            "proof_points": proof_points,
-            "ad_flow": ad_flow,
-            "structure_labels": structure_labels,
-            "primary_structure": build_primary_structure(ad_flow),
-            "first_cta_time": first_cta_time,
-            "first_value_time": first_value_time,
-            "first_proof_time": first_proof_time,
-            "first_offer_time": first_offer_time,
-            "cta_count": len(ctas),
-            "issues": issues,
-            "recommendations": recommendations,
-            "improvements": improvements,
-            "hook_score": score_payload["hook_score"],
-            "proof_score": score_payload["proof_score"],
-            "value_score": score_payload["value_score"],
-            "cta_score": score_payload["cta_score"],
-            "offer_score": score_payload["offer_score"],
-            "ad_score": score_payload["ad_score"],
-        }
 
         write_json(insights_path, insights)
         media_meta["insights_path"] = "insights.json"
+        media_meta["analysis_mode"] = "transcript"
+        media_meta["analysis_status"] = "completed"
+        media_meta["confidence"] = "high"
         write_json(media_meta_path, media_meta)
         print_ad_summary(
             ad_id=ad_id,
-            ad_score=score_payload["ad_score"],
-            primary_structure=insights["primary_structure"],
-            hook=hook_segment,
-            proof_points=proof_points,
-            value_props=value_props,
-            ctas=ctas,
-            offers=offers,
-            first_cta_time=first_cta_time,
-            improvements=improvements,
+            ad_score=int(insights["ad_score"]),
+            primary_structure=str(insights["primary_structure"]),
+            hook=insights["hook"],
+            proof_points=insights["proof_points"],
+            value_props=insights["value_props"],
+            ctas=insights["ctas"],
+            offers=insights["offers"],
+            first_cta_time=insights["first_cta_time"],
+            improvements=insights["improvements"],
         )
         analyzed_count += 1
 
     typer.echo(f"Analyzed transcripts for {analyzed_count} ads")
     return analyzed_count
+
+
+def build_insights_from_segments(
+    *,
+    ad_id: str,
+    normalized_segments: list[dict[str, str | float]],
+    use_llm: bool,
+    analysis_mode: str,
+    confidence: str,
+) -> dict[str, Any]:
+    full_text = " ".join(str(segment["text"]) for segment in normalized_segments)
+    language = "hindi_or_hinglish" if has_devanagari(full_text) else "english"
+
+    aggregated_signals = {
+        "value_props": [],
+        "offers": [],
+        "pain_points": [],
+        "proof_points": [],
+    }
+    ctas: list[dict[str, str | float]] = []
+    ad_flow: list[dict[str, str | float]] = []
+    hook_segment: dict[str, str | float] | None = None
+
+    for index, segment in enumerate(normalized_segments):
+        flow_label = None
+        extracted: dict[str, list[str]] = {}
+        if use_llm:
+            llm_response = classify_segment_with_llm(str(segment["text"]))
+            flow_label = llm_response.get("flow_label") if isinstance(llm_response, dict) else None
+            extracted = llm_response.get("extracted", {}) if isinstance(llm_response, dict) else {}
+        ensure_extracted_defaults(extracted)
+        add_heuristic_extraction(str(segment["text"]), extracted)
+        if use_llm:
+            debug_segment_outputs(str(segment["text"]), flow_label, extracted)
+        stage = choose_segment_stage(
+            str(segment["text"]),
+            is_first=index == 0,
+            llm_flow=flow_label,
+        )
+        block = {
+            "text": segment["text"],
+            "start": segment["start"],
+            "end": segment["end"],
+        }
+
+        if stage == "hook":
+            hook_segment = hook_segment or block
+        elif stage == "cta":
+            ctas.append(block)
+
+        ad_flow.append(
+            {
+                "stage": stage,
+                "text": segment["text"],
+                "start": segment["start"],
+                "end": segment["end"],
+            }
+        )
+        add_extracted_signals(aggregated_signals, extracted, segment)
+
+    if hook_segment is None:
+        first_segment = normalized_segments[0]
+        hook_segment = {
+            "text": first_segment["text"],
+            "type": "generic",
+            "start": first_segment["start"],
+            "end": first_segment["end"],
+        }
+    else:
+        hook_segment = {
+            "text": hook_segment["text"],
+            "type": classify_hook_type(str(hook_segment["text"])),
+            "start": hook_segment["start"],
+            "end": hook_segment["end"],
+        }
+
+    summary_segments = [
+        str(segment["text"])
+        for segment in normalized_segments
+        if is_meaningful_text(str(segment["text"]))
+    ][:3]
+    summary = " ".join(summary_segments).strip()
+    pain_points = aggregated_signals["pain_points"]
+    value_props = aggregated_signals["value_props"]
+    proof_points = aggregated_signals["proof_points"]
+    offers = aggregated_signals["offers"]
+    first_pain_time = first_stage_time(pain_points)
+    first_value_time = first_stage_time(value_props)
+    first_proof_time = first_stage_time(proof_points)
+    first_offer_time = first_stage_time(offers)
+    first_cta_time = first_stage_time(ctas)
+    structure_labels = {
+        "pain_before_value": compare_stage_times(first_pain_time, first_value_time),
+        "proof_before_cta": compare_stage_times(first_proof_time, first_cta_time),
+        "cta_after_value": compare_stage_times(first_value_time, first_cta_time),
+        "cta_before_value": compare_stage_times(first_cta_time, first_value_time),
+        "offer_before_cta": compare_stage_times(first_offer_time, first_cta_time),
+    }
+    issues, recommendations = build_issues_and_recommendations(
+        hook=hook_segment,
+        offers=offers,
+        proof_points=proof_points,
+        first_cta_time=first_cta_time,
+        first_value_time=first_value_time,
+        cta_count=len(ctas),
+    )
+    improvements = build_improvements(
+        hook=hook_segment,
+        offers=offers,
+        value_props=value_props,
+        ctas=ctas,
+        proof_points=proof_points,
+        cta_before_value=structure_labels["cta_before_value"],
+    )
+    score_payload = build_ad_scores(
+        hook=hook_segment,
+        proof_points=proof_points,
+        value_props=value_props,
+        ctas=ctas,
+        offers=offers,
+        cta_before_value=structure_labels["cta_before_value"],
+    )
+
+    return {
+        "ad_id": ad_id,
+        "language": language,
+        "analysis_mode": analysis_mode,
+        "confidence": confidence,
+        "pain_points": pain_points,
+        "summary": summary,
+        "hook": hook_segment,
+        "value_props": value_props,
+        "offers": offers,
+        "ctas": ctas,
+        "proof_points": proof_points,
+        "ad_flow": ad_flow,
+        "structure_labels": structure_labels,
+        "primary_structure": build_primary_structure(ad_flow),
+        "first_cta_time": first_cta_time,
+        "first_value_time": first_value_time,
+        "first_proof_time": first_proof_time,
+        "first_offer_time": first_offer_time,
+        "cta_count": len(ctas),
+        "issues": issues,
+        "recommendations": recommendations,
+        "improvements": improvements,
+        "hook_score": score_payload["hook_score"],
+        "proof_score": score_payload["proof_score"],
+        "value_score": score_payload["value_score"],
+        "cta_score": score_payload["cta_score"],
+        "offer_score": score_payload["offer_score"],
+        "ad_score": score_payload["ad_score"],
+    }
+
+
+def build_visual_segments_from_ocr(
+    ocr_entries: list[dict[str, Any]],
+) -> list[dict[str, str | float]]:
+    segments: list[dict[str, str | float]] = []
+    for entry in ocr_entries:
+        if not isinstance(entry, dict):
+            continue
+        raw_text = str(entry.get("text", "")).strip()
+        text = normalize_ocr_text(raw_text)
+        if not text:
+            continue
+        start = frame_name_to_seconds(str(entry.get("frame", "")))
+        segments.append(
+            {
+                "text": text,
+                "start": start,
+                "end": start + 1.0,
+            }
+        )
+    return segments
+
+
+def normalize_ocr_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def frame_name_to_seconds(frame_name: str) -> float:
+    match = re.search(r"(\d+)", frame_name)
+    if not match:
+        return 0.0
+    return float(int(match.group(1)))
+
+
+def is_visual_signal_strong(
+    segments: list[dict[str, str | float]],
+) -> bool:
+    if not segments:
+        return False
+
+    meaningful_texts = [
+        str(segment["text"]).strip()
+        for segment in segments
+        if is_meaningful_visual_text(str(segment["text"]))
+    ]
+    if meaningful_texts:
+        return True
+
+    if any(has_cta_intent(str(segment["text"])) for segment in segments):
+        return True
+
+    return has_repeated_visual_value_text(segments)
+
+
+def is_meaningful_visual_text(text: str) -> bool:
+    words = re.findall(r"[A-Za-z]{3,}", text)
+    if len(words) >= 2:
+        return True
+    return is_value_prop_text(text)
+
+
+def has_repeated_visual_value_text(
+    segments: list[dict[str, str | float]],
+) -> bool:
+    repeated_texts: dict[str, int] = {}
+    repeated_words: dict[str, int] = {}
+
+    for segment in segments:
+        text = str(segment["text"]).strip().lower()
+        if not text:
+            continue
+        repeated_texts[text] = repeated_texts.get(text, 0) + 1
+        for word in re.findall(r"[A-Za-z]{4,}", text):
+            repeated_words[word] = repeated_words.get(word, 0) + 1
+
+    if any(count >= 2 and is_value_prop_text(text) for text, count in repeated_texts.items()):
+        return True
+    return any(count >= 2 for count in repeated_words.values())
 
 
 def read_json(path: Path):

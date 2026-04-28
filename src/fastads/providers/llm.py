@@ -217,18 +217,28 @@ def _normalize_strategy_payload(payload: dict[str, Any]) -> tuple[dict[str, Any]
         if isinstance(raw, list):
             return raw
         if isinstance(raw, dict):
-            for key in ("steps", "what_we_observed", "observations"):
+            for key in ("steps", "stages", "what_we_observed", "observations", "recipe"):
                 candidate = raw.get(key)
                 if isinstance(candidate, list):
                     return candidate
+            script_block = raw.get("script")
+            if isinstance(script_block, dict):
+                stages = script_block.get("stages")
+                if isinstance(stages, list):
+                    return stages
             # Some payloads put steps under a nested key
             for parent in ("plan", "manifest", "structure"):
                 child = raw.get(parent)
                 if isinstance(child, dict):
-                    for key in ("steps", "what_we_observed", "observations"):
+                    for key in ("steps", "stages", "what_we_observed", "observations", "recipe"):
                         candidate = child.get(key)
                         if isinstance(candidate, list):
                             return candidate
+                    script_block = child.get("script")
+                    if isinstance(script_block, dict):
+                        stages = script_block.get("stages")
+                        if isinstance(stages, list):
+                            return stages
         return None
 
     competitor_raw = _extract_competitor(payload.get("competitor_recipe")) or payload.get("competitor_recipe")
@@ -240,6 +250,10 @@ def _normalize_strategy_payload(payload: dict[str, Any]) -> tuple[dict[str, Any]
         competitor_steps = _coerce_steps(payload.get("steps"), competitor_keys, allowed)
         if competitor_steps:
             fallback_warning = "Converted legacy 'steps' schema for competitor_recipe."
+    if not competitor_steps and isinstance(payload.get("stages"), list):
+        competitor_steps = _coerce_steps(payload.get("stages"), competitor_keys, allowed)
+        if competitor_steps:
+            fallback_warning = "Converted legacy 'stages' schema for competitor_recipe."
 
     your_keys = ("timestamp", "stage", "say", "show", "why")
     your_raw = payload.get("your_recipe")
@@ -251,6 +265,11 @@ def _normalize_strategy_payload(payload: dict[str, Any]) -> tuple[dict[str, Any]
                 candidate = raw.get(key)
                 if isinstance(candidate, list):
                     return candidate
+            script_block = raw.get("script")
+            if isinstance(script_block, dict):
+                stages = script_block.get("stages")
+                if isinstance(stages, list):
+                    return stages
             for parent in ("plan", "goal", "approach"):
                 nested = raw.get(parent)
                 if isinstance(nested, dict):
@@ -258,6 +277,11 @@ def _normalize_strategy_payload(payload: dict[str, Any]) -> tuple[dict[str, Any]
                         candidate = nested.get(key)
                         if isinstance(candidate, list):
                             return candidate
+                    script_block = nested.get("script")
+                    if isinstance(script_block, dict):
+                        stages = script_block.get("stages")
+                        if isinstance(stages, list):
+                            return stages
         return None
 
     your_steps = _coerce_steps(_extract_your(your_raw), your_keys, allowed)
@@ -265,6 +289,14 @@ def _normalize_strategy_payload(payload: dict[str, Any]) -> tuple[dict[str, Any]
         your_steps = _coerce_steps(your_raw, your_keys, allowed)
     if not your_steps:
         your_steps = _coerce_steps(None, your_keys, allowed)
+    if not your_steps and isinstance(payload.get("stages"), list):
+        your_steps = _coerce_steps(payload.get("stages"), your_keys, allowed)
+    if not your_steps:
+        script_block = payload.get("script")
+        if isinstance(script_block, dict):
+            stages = script_block.get("stages")
+            if isinstance(stages, list):
+                your_steps = _coerce_steps(stages, your_keys, allowed)
 
     def _ensure_list(key: str) -> List[str]:
         sources: List[dict[str, Any]] = []
@@ -275,6 +307,8 @@ def _normalize_strategy_payload(payload: dict[str, Any]) -> tuple[dict[str, Any]
                 if isinstance(block, dict):
                     sources.append(block)
         sources.append(payload)
+        if isinstance(payload.get("competitor_recipe"), dict):
+            sources.append(payload["competitor_recipe"])
         for source in sources:
             if not isinstance(source, dict):
                 continue
@@ -292,6 +326,8 @@ def _normalize_strategy_payload(payload: dict[str, Any]) -> tuple[dict[str, Any]
         script_source = your_raw.get("script")
     if script_source is None:
         script_source = payload.get("script") or {}
+    if not script_source and isinstance(payload.get("competitor_recipe"), dict):
+        script_source = payload["competitor_recipe"].get("script") or {}
 
     def _script_value(key: str) -> str:
         if not script_source:
