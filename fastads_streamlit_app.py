@@ -1,8 +1,10 @@
 import io
+import hashlib
 import json
 import os
 import re
 import shutil
+import uuid
 import subprocess
 import asyncio
 from pathlib import Path
@@ -307,15 +309,153 @@ def sanitize_meta_error_message(message: str) -> str:
     return sanitized
 
 
-def build_narration_text(script: Dict[str, Any]) -> str:
-    parts = [
-        _get_script_value(script, "hook"),
-        _get_script_value(script, "proof"),
-        _get_script_value(script, "value"),
-        _get_script_value(script, "cta"),
+def _clean_voice_clause(text: str) -> str:
+    raw = str(text or "").strip()
+    if not raw or raw == "—":
+        return ""
+
+    raw = re.sub(r"[\(\)\[\]{}\"“”'’,:|—–-]+", " ", raw)
+    raw = re.sub(r"\s+", " ", raw).strip()
+    if not raw:
+        return ""
+
+    stop_words = {
+        "the",
+        "a",
+        "an",
+        "and",
+        "or",
+        "to",
+        "of",
+        "for",
+        "with",
+        "your",
+        "you",
+        "our",
+        "we",
+        "is",
+        "are",
+        "be",
+        "this",
+        "that",
+        "it",
+        "on",
+        "in",
+        "at",
+        "by",
+        "from",
+        "as",
+        "now",
+        "today",
+    }
+
+    clauses = [part.strip() for part in re.split(r"[.!?;\n]+", raw) if part.strip()]
+    if not clauses:
+        clauses = [raw]
+
+    candidates: List[List[str]] = []
+    for clause in clauses:
+        clause = re.sub(r"\b(button|arrow|overlay|montage|graphic|badge|style|screen|text|caption)\b", " ", clause, flags=re.I)
+        clause = re.sub(r"\s+", " ", clause).strip()
+        tokens = [token for token in clause.split() if token]
+        tokens = [token for token in tokens if token.lower() not in stop_words]
+        if tokens:
+            candidates.append(tokens)
+
+    if not candidates:
+        tokens = [token for token in raw.split() if token and token.lower() not in stop_words]
+        candidates = [tokens] if tokens else []
+
+    if not candidates:
+        return ""
+
+    candidates.sort(key=lambda item: (len(item), len(" ".join(item))), reverse=True)
+    chosen = candidates[0][:8]
+    return " ".join(chosen).strip()
+
+
+def _shape_voice_line(text: str, max_words: int = 8) -> str:
+    line = _clean_voice_clause(text)
+    if not line:
+        return ""
+    words = [word for word in line.split() if word]
+    if len(words) > max_words:
+        words = words[:max_words]
+    return " ".join(words).strip()
+
+
+def _prepare_tts_line(text: str) -> str:
+    raw_text = str(text or "").strip()
+    if not raw_text:
+        return ""
+
+    raw_text = re.sub(r"\s+", " ", raw_text)
+    raw_text = re.sub(r"\s*[,،]\s*", "... ", raw_text)
+    raw_text = re.sub(r"\s*[—–]\s*", "... ", raw_text)
+    raw_text = re.sub(r"\s+\.\.\.\s+", "... ", raw_text)
+    raw_text = re.sub(r"\.\.{4,}", "...", raw_text)
+    raw_text = re.sub(r"\s+", " ", raw_text).strip()
+    raw_text = re.sub(r"\.\.\.\s+\.\.\.\s+", "... ", raw_text)
+    return raw_text
+
+
+def _stage_name_order(stage_name: str) -> int:
+    order = {"hook": 0, "proof": 1, "value": 2, "cta": 3}
+    return order.get(str(stage_name or "").strip().lower(), 99)
+
+
+def _collect_stage_say_lines(strategy_payload: Dict[str, Any]) -> List[Tuple[str, str]]:
+    raw_steps = strategy_payload.get("your_recipe_steps", []) or []
+    ordered_lines: List[Tuple[int, str, str]] = []
+
+    for step in raw_steps:
+        if not isinstance(step, dict):
+            continue
+        stage_name = str(step.get("stage", "")).strip().lower()
+        if stage_name not in {"hook", "proof", "value", "cta"}:
+            continue
+        say_text = ""
+        for key in ("say", "SAY"):
+            value = str(step.get(key, "")).strip()
+            if value:
+                say_text = value
+                break
+        if not say_text:
+            continue
+        ordered_lines.append((_stage_name_order(stage_name), stage_name, say_text))
+
+    ordered_lines.sort(key=lambda item: item[0])
+    return [(stage_name, say_text) for _, stage_name, say_text in ordered_lines]
+
+
+def _fallback_script_lines(script: Dict[str, Any]) -> List[Tuple[str, str]]:
+    stage_parts = [
+        ("hook", _get_script_value(script, "hook")),
+        ("proof", _get_script_value(script, "proof")),
+        ("value", _get_script_value(script, "value")),
+        ("cta", _get_script_value(script, "cta")),
     ]
-    cleaned_parts = [part.strip() for part in parts if part and part.strip() and part.strip() != "—"]
-    return " ".join(cleaned_parts).strip()
+    return [(stage_name, part) for stage_name, part in stage_parts if str(part).strip() and str(part).strip() != "—"]
+
+
+def build_narration_text(strategy_payload: Dict[str, Any]) -> str:
+    say_lines = _collect_stage_say_lines(strategy_payload)
+    if not say_lines:
+        script = strategy_payload.get("script", {}) or {}
+        if isinstance(script, dict):
+            say_lines = _fallback_script_lines(script)
+
+    if not say_lines:
+        return ""
+
+    shaped_lines: List[str] = []
+    for stage_name, part in say_lines:
+        line = _prepare_tts_line(part)
+        if not line:
+            continue
+        shaped_lines.append(line)
+
+    return " ... ".join(shaped_lines).strip()
 
 
 def select_edge_tts_voice(narration_text: str) -> str:
@@ -329,11 +469,12 @@ async def generate_voiceover_edge_tts(narration_text: str, output_path: Path, vo
     await communicate.save(str(output_path))
 
 
-def ensure_voiceover(job_dir: Path, script: Dict[str, Any]) -> tuple[Path | None, Dict[str, Any] | None]:
+def ensure_voiceover(job_dir: Path, strategy_payload: Dict[str, Any]) -> tuple[Path | None, Dict[str, Any] | None]:
     voiceover_path = job_dir / "voiceover.mp3"
     voice_meta_path = job_dir / "voiceover.voice.txt"
+    voice_meta_json_path = job_dir / "voiceover.meta.json"
 
-    narration_text = build_narration_text(script)
+    narration_text = build_narration_text(strategy_payload)
     if not narration_text:
         return None, {
             "provider": "",
@@ -345,22 +486,40 @@ def ensure_voiceover(job_dir: Path, script: Dict[str, Any]) -> tuple[Path | None
 
     try:
         selected_voice = select_edge_tts_voice(narration_text)
+        cache_signature = _voiceover_cache_signature(strategy_payload)
+
         def _valid_audio_file(path: Path) -> bool:
             return path.exists() and path.stat().st_size > 10 * 1024
 
         cached_voice = voice_meta_path.read_text(encoding="utf-8").strip() if voice_meta_path.exists() else ""
-        if _valid_audio_file(voiceover_path) and cached_voice == selected_voice:
-            return voiceover_path, {"provider": f"Edge TTS:{selected_voice}"}
+        cached_meta = load_json(voice_meta_json_path) or {}
+        cached_signature = str(cached_meta.get("signature", "")).strip()
+        if _valid_audio_file(voiceover_path) and cached_voice == selected_voice and cached_signature == cache_signature:
+            return voiceover_path, {"provider": f"Edge TTS:{selected_voice}", "signature": cache_signature}
 
         if voiceover_path.exists():
             voiceover_path.unlink(missing_ok=True)
         if voice_meta_path.exists():
             voice_meta_path.unlink(missing_ok=True)
+        if voice_meta_json_path.exists():
+            voice_meta_json_path.unlink(missing_ok=True)
 
         asyncio.run(generate_voiceover_edge_tts(narration_text, voiceover_path, selected_voice))
         if _valid_audio_file(voiceover_path):
             voice_meta_path.write_text(selected_voice, encoding="utf-8")
-            return voiceover_path, {"provider": f"Edge TTS:{selected_voice}"}
+            voice_meta_json_path.write_text(
+                json.dumps(
+                    {
+                        "provider": "Edge TTS",
+                        "voice": selected_voice,
+                        "signature": cache_signature,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            return voiceover_path, {"provider": f"Edge TTS:{selected_voice}", "signature": cache_signature}
         if voiceover_path.exists():
             voiceover_path.unlink(missing_ok=True)
         return None, {
@@ -373,6 +532,8 @@ def ensure_voiceover(job_dir: Path, script: Dict[str, Any]) -> tuple[Path | None
     except Exception as exc:
         if voiceover_path.exists():
             voiceover_path.unlink(missing_ok=True)
+        if voice_meta_json_path.exists():
+            voice_meta_json_path.unlink(missing_ok=True)
         return None, {
             "provider": "Edge TTS",
             "message": "Edge TTS generation failed",
@@ -468,19 +629,33 @@ def _draw_centered_block(
 
 def _build_pollinations_prompt(scene: Dict[str, str]) -> str:
     stage = str(scene.get("label") or scene.get("stage", "Scene")).strip().title()
-    show_text = str(scene.get("show", "")).strip() or str(scene.get("say", "")).strip()
-    prompt = (
-        f"{stage} scene for a direct-response ad. "
-        f"{show_text}. "
-        "vertical 9:16 ad visual, cinematic, high quality, realistic, no text, no watermark"
-    )
+    say_text = str(scene.get("say", "")).strip()
+    show_text = str(scene.get("show", "")).strip()
+    narrative = " ".join(part for part in (say_text, show_text) if part).strip()
+
+    stage_prompts = {
+        "Hook": "person holding knee in pain at home, concerned but relatable, living room setting",
+        "Proof": "yoga trainer guiding beginner in living room, supportive instruction, same home setting",
+        "Value": "person doing simple yoga stretch on mat at home, calm and consistent environment",
+        "CTA": "mobile phone showing booking screen in hand, home setting, clear booking action",
+    }
+
+    prompt_parts = [
+        stage_prompts.get(stage, "home ad scene, same persona, same environment"),
+        "same persona, same home environment, continuous story, realistic ad creative",
+    ]
+    if narrative:
+        prompt_parts.append(_clean_voice_clause(narrative))
+    prompt_parts.append("vertical 9:16 ad visual, cinematic, high quality, realistic, no text, no watermark")
+
+    prompt = ". ".join(part.strip().rstrip(".") for part in prompt_parts if part and part.strip())
     words = prompt.split()
-    if len(words) > 95:
-        prompt = " ".join(words[:95])
+    if len(words) > 100:
+        prompt = " ".join(words[:100])
     return prompt.strip()
 
 
-def clean_overlay_text(say_text: str) -> str:
+def clean_overlay_text(say_text: str, stage: str = "") -> str:
     raw_text = str(say_text or "").strip()
     if not raw_text:
         return ""
@@ -552,6 +727,170 @@ def clean_overlay_text(say_text: str) -> str:
                 break
 
     return " ".join(best_tokens[:6]).title().strip()
+
+
+def _dominant_script_family(*texts: str) -> str:
+    devanagari_count = 0
+    latin_count = 0
+    for text in texts:
+        raw = str(text or "")
+        devanagari_count += len(re.findall(r"[\u0900-\u097F]", raw))
+        latin_count += len(re.findall(r"[A-Za-z]", raw))
+    if devanagari_count and devanagari_count >= latin_count:
+        return "devanagari"
+    if latin_count:
+        return "latin"
+    return ""
+
+
+def _tokens_for_script(text: str, family: str) -> List[str]:
+    raw_tokens = [token for token in re.split(r"\s+", str(text or "").strip()) if token]
+    if not family:
+        return raw_tokens
+
+    filtered: List[str] = []
+    for token in raw_tokens:
+        if family == "devanagari" and re.search(r"[\u0900-\u097F]", token):
+            filtered.append(token)
+        elif family == "latin" and re.search(r"[A-Za-z]", token):
+            filtered.append(token)
+    return filtered or raw_tokens
+
+
+def _compact_copy_from_text(text: str, family: str, max_words: int = 8) -> str:
+    raw_text = str(text or "").strip()
+    if not raw_text:
+        return ""
+
+    clauses = [part.strip() for part in re.split(r"[.!?;\n]+", raw_text) if part.strip()]
+    if not clauses:
+        clauses = [raw_text]
+
+    stop_words = {
+        "a",
+        "an",
+        "and",
+        "are",
+        "be",
+        "click",
+        "for",
+        "from",
+        "go",
+        "here",
+        "in",
+        "is",
+        "it",
+        "just",
+        "link",
+        "now",
+        "of",
+        "on",
+        "please",
+        "register",
+        "seat",
+        "tap",
+        "the",
+        "this",
+        "to",
+        "today",
+        "try",
+        "us",
+        "was",
+        "we",
+        "with",
+        "you",
+        "your",
+    }
+
+    candidates: List[List[str]] = []
+    for clause in clauses:
+        clause = re.sub(r"[\(\)\[\]{}\"“”'’,:|—–-]+", " ", clause)
+        clause = re.sub(r"\s+", " ", clause).strip()
+        tokens = _tokens_for_script(clause, family)
+        tokens = [token for token in tokens if token.lower() not in stop_words]
+        if tokens:
+            candidates.append(tokens)
+
+    if not candidates:
+        tokens = [token for token in _tokens_for_script(raw_text, family) if token.lower() not in stop_words]
+        if tokens:
+            candidates = [tokens]
+
+    if not candidates:
+        return ""
+
+    candidates.sort(key=lambda item: (len(item), len(" ".join(item))), reverse=True)
+    chosen = candidates[0][:max_words]
+    return " ".join(chosen).strip()
+
+
+def _stage_overlay_phrase(stage: str, say_text: str, show_text: str) -> str:
+    stage_name = str(stage or "").strip().title()
+    family = _dominant_script_family(say_text, show_text)
+    say_copy = _compact_copy_from_text(say_text, family, max_words=8)
+    show_copy = _compact_copy_from_text(show_text, family, max_words=8)
+
+    if stage_name == "Hook":
+        base = say_copy or show_copy
+        if not base:
+            base = _minimal_show_keywords(show_text)
+        base = base.split("?")[0].split("!")[0].strip()
+        words = [word for word in base.split() if word][:6]
+        if not words:
+            return "Back Pain? Fix This"
+        if len(words) >= 2 and not base.endswith("?"):
+            return f"{' '.join(words[:2]).title()}? Fix This"
+        return f"{' '.join(words).title()}? Fix This"
+
+    if stage_name == "Proof":
+        base = say_copy or show_copy
+        if not base:
+            return "14 Day Guided Plan"
+        digits = re.findall(r"\b\d+\b", base)
+        if digits:
+            prefix = f"{digits[0]} Day"
+            tail_tokens = [word for word in re.split(r"\s+", re.sub(r"\b\d+\b", " ", base)) if word]
+            tail_tokens = tail_tokens[:4] if tail_tokens else ["Guided", "Plan"]
+            return " ".join([prefix] + tail_tokens[:4]).title().strip()
+        tokens = [word for word in base.split() if word][:5]
+        if len(tokens) < 2:
+            return "Guided Plan"
+        return " ".join(tokens[:5]).title().strip()
+
+    if stage_name == "Value":
+        base_parts: List[str] = []
+        for candidate in (say_copy, show_copy):
+            if not candidate:
+                continue
+            candidate_tokens = [word for word in candidate.split() if word]
+            if candidate_tokens:
+                base_parts.append(" ".join(candidate_tokens[:4]))
+        if base_parts:
+            joined = " + ".join(base_parts[:2])
+            words = [word for word in joined.split() if word][:8]
+            return " ".join(words).title().strip()
+        return "Daily Yoga + Face Yoga"
+
+    if stage_name == "CTA":
+        base = say_copy or show_copy
+        if not base:
+            return "Book Free Seat"
+        action_words = {"book", "start", "join", "register", "tap", "reserve", "begin"}
+        tokens = [word for word in base.split() if word]
+        selected: List[str] = []
+        for token in tokens:
+            if token.lower().strip(".,!?") in action_words or not selected:
+                selected.append(token)
+            if len(selected) >= 4:
+                break
+        if selected:
+            return " ".join(selected[:4]).title().strip()
+        return "Book Free Seat"
+
+    base = say_copy or show_copy or _minimal_show_keywords(show_text)
+    if not base:
+        return ""
+    return " ".join([word for word in base.split() if word][:8]).title().strip()
 
 
 def _short_bottom_subtitle(say_text: str) -> str:
@@ -672,6 +1011,21 @@ def _minimal_show_keywords(show_text: str) -> str:
     shortlist = tokens[:6]
     result = " ".join(shortlist).strip()
     return result.title()
+
+
+def _overlay_copy_for_scene(stage: str, say_text: str, show_text: str) -> str:
+    stage_name = str(stage or "").strip().title()
+    copy = _stage_overlay_phrase(stage_name, say_text, show_text)
+    if copy:
+        return copy
+
+    fallback_map = {
+        "Hook": "Back Pain? Fix This",
+        "Proof": "14 Day Guided Plan",
+        "Value": "Daily Yoga + Face Yoga",
+        "CTA": "Book Free Seat",
+    }
+    return fallback_map.get(stage_name, "Book Free Seat")
 
 
 def _scene_text_layout(stage: str) -> Dict[str, Any]:
@@ -925,14 +1279,10 @@ def _render_storyboard_scene_image(
 
     show_text = str(scene.get("show", "")).strip()
     say_text = str(scene.get("say", "")).strip()
-    overlay_text = clean_overlay_text(say_text)
-    if not overlay_text:
-        overlay_text = _minimal_show_keywords(show_text)
-    if not overlay_text:
-        overlay_text = stage_label
+    overlay_text = _overlay_copy_for_scene(stage_label, say_text, show_text)
 
     if layout.get("cta"):
-        cta_text = clean_overlay_text(say_text) or overlay_text
+        cta_text = _overlay_copy_for_scene(stage_label, say_text, show_text) or overlay_text
         cta_text = cta_text or "Book Free Seat"
         cta_box = (210, 1460, 870, 1580)
         try:
@@ -984,13 +1334,18 @@ def _generate_storyboard_preview_with_ffmpeg(
     voiceover_path: Path | None,
 ) -> None:
     preview_path.unlink(missing_ok=True)
-    concat_list_path = preview_path.with_name("concat_list.txt")
+    render_id = uuid.uuid4().hex[:10]
+    temp_render_dir = preview_path.with_name(f".preview_{render_id}")
+    temp_render_dir.mkdir(parents=True, exist_ok=True)
     scene_video_paths: List[Path] = []
+    transition_duration = 0.6
+    fps = 24
 
     try:
         for scene_path, duration in zip(scene_paths, durations):
-            scene_video_path = scene_path.with_suffix(".mp4")
+            scene_video_path = temp_render_dir / f"{scene_path.stem}.mp4"
             scene_video_path.unlink(missing_ok=True)
+            frame_count = max(1, int(round(duration * fps)))
             scene_cmd = [
                 "ffmpeg",
                 "-y",
@@ -998,26 +1353,56 @@ def _generate_storyboard_preview_with_ffmpeg(
                 "1",
                 "-i",
                 str(scene_path),
+                "-vf",
+                (
+                    "scale=1080:1920:force_original_aspect_ratio=increase,"
+                    "crop=1080:1920,"
+                    "zoompan=z='min(zoom+0.0015,1.08)':d="
+                    f"{frame_count}:s=1080x1920:fps={fps},"
+                    "fade=t=in:st=0:d=0.5,format=yuv420p"
+                ),
                 "-c:v",
                 "libx264",
                 "-t",
                 str(duration),
-                "-vf",
-                "scale=1080:1920,format=yuv420p",
                 "-pix_fmt",
                 "yuv420p",
                 "-r",
-                "24",
+                str(fps),
                 "-an",
                 str(scene_video_path),
             ]
             result = _run_ffmpeg_command(scene_cmd)
             if result.returncode != 0:
                 raise RuntimeError(result.stderr.strip() or "Failed to create scene clip.")
+            if not scene_video_path.exists() or scene_video_path.stat().st_size <= 10 * 1024:
+                raise RuntimeError(f"Scene clip generation failed for {scene_path.name}.")
             scene_video_paths.append(scene_video_path)
 
-        filter_inputs = "".join(f"[{index}:v]" for index in range(len(scene_video_paths)))
-        filter_complex = f"{filter_inputs}concat=n={len(scene_video_paths)}:v=1:a=0[v]"
+        if not scene_video_paths:
+            raise RuntimeError("No scene clips were created.")
+
+        filter_parts: List[str] = []
+        for index in range(len(scene_video_paths)):
+            filter_parts.append(f"[{index}:v]setpts=PTS-STARTPTS[v{index}]")
+
+        if len(scene_video_paths) == 1:
+            filter_parts.append("[v0]null[v]")
+        else:
+            current_label = "v0"
+            current_duration = float(durations[0])
+            for index in range(1, len(scene_video_paths)):
+                next_label = f"v{index}"
+                output_label = f"x{index}"
+                offset = max(0.0, current_duration - transition_duration)
+                filter_parts.append(
+                    f"[{current_label}][{next_label}]xfade=transition=fade:duration={transition_duration}:offset={offset:.2f}[{output_label}]"
+                )
+                current_label = output_label
+                current_duration = current_duration + float(durations[index]) - transition_duration
+            filter_parts.append(f"[{current_label}]format=yuv420p[v]")
+
+        filter_complex = ";".join(filter_parts)
         concat_cmd = ["ffmpeg", "-y"]
         for scene_video_path in scene_video_paths:
             concat_cmd.extend(["-i", str(scene_video_path)])
@@ -1032,7 +1417,9 @@ def _generate_storyboard_preview_with_ffmpeg(
             "-pix_fmt",
             "yuv420p",
             "-r",
-            "24",
+            str(fps),
+            "-movflags",
+            "+faststart",
         ])
         if voiceover_path and voiceover_path.exists() and voiceover_path.stat().st_size > 10 * 1024:
             concat_cmd.extend(["-c:a", "aac"])
@@ -1049,7 +1436,7 @@ def _generate_storyboard_preview_with_ffmpeg(
     finally:
         for scene_video_path in scene_video_paths:
             scene_video_path.unlink(missing_ok=True)
-        concat_list_path.unlink(missing_ok=True)
+        shutil.rmtree(temp_render_dir, ignore_errors=True)
 
 
 def ensure_generated_ad_preview(
@@ -1060,6 +1447,13 @@ def ensure_generated_ad_preview(
     preview_path = job_dir / "generated_ad_preview.mp4"
     scenes_dir = job_dir / "scenes"
     scene_manifest_path = job_dir / "generated_ad_preview.scenes.json"
+    voice_meta_json_path = job_dir / "voiceover.meta.json"
+    current_voice_signature = ""
+    voice_meta = load_json(voice_meta_json_path)
+    if isinstance(voice_meta, dict):
+        current_voice_signature = str(voice_meta.get("signature", "")).strip()
+    if not current_voice_signature:
+        current_voice_signature = _voiceover_cache_signature(strategy_payload)
 
     def _valid_preview(path: Path) -> bool:
         return path.exists() and path.stat().st_size > 50 * 1024
@@ -1070,6 +1464,7 @@ def ensure_generated_ad_preview(
             if (
                 isinstance(manifest, dict)
                 and manifest.get("version") == STORYBOARD_RENDER_VERSION
+                and str(manifest.get("voiceover_signature", "")).strip() == current_voice_signature
                 and isinstance(manifest.get("scenes"), list)
                 and any(
                     isinstance(item, dict) and item.get("source") == "AI image"
@@ -1153,6 +1548,7 @@ def ensure_generated_ad_preview(
                     json.dumps(
                         {
                             "version": STORYBOARD_RENDER_VERSION,
+                            "voiceover_signature": current_voice_signature,
                             "scenes": scene_sources,
                         },
                         ensure_ascii=False,
@@ -1290,6 +1686,20 @@ def load_text(path: Path) -> str:
 def load_pipeline_output(job_dir: Path) -> Optional[Dict[str, Any]]:
     payload = load_json(job_dir / "pipeline_output.json")
     return payload if isinstance(payload, dict) else None
+
+
+def _stable_json_hash(value: Any) -> str:
+    try:
+        serialized = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except Exception:
+        serialized = str(value or "")
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _voiceover_cache_signature(strategy_payload: Dict[str, Any]) -> str:
+    narration_text = build_narration_text(strategy_payload)
+    voice = select_edge_tts_voice(narration_text) if narration_text else ""
+    return _stable_json_hash({"narration_text": narration_text, "voice": voice})
 
 
 def load_strategy_payload(ad_dir: Path) -> Optional[Dict[str, Any]]:
@@ -1658,6 +2068,50 @@ def render_strategy_card(ad_name: str, payload: Dict[str, Any]) -> None:
     _render_your_recipe(payload.get("your_recipe_steps", []))
 
 
+def ensure_strategy_payload_for_item(item: Dict[str, Any], goal: str) -> Optional[Dict[str, Any]]:
+    ad_dir = item.get("dir")
+    if not isinstance(ad_dir, Path):
+        return None
+
+    strategy_path = ad_dir / "strategy.json"
+    raw_path = ad_dir / "strategy_raw_response.json"
+
+    if strategy_path.exists():
+        loaded_strategy = load_json(strategy_path)
+        if isinstance(loaded_strategy, dict):
+            return build_strategy_display_payload(loaded_strategy)
+
+    insights = item.get("insights", {}) or {}
+    ad_flow_text = format_flow_segments_for_prompt(insights.get("ad_flow", []))
+    pain_text = join_items_for_prompt(flatten_text_items(insights.get("pain_points", [])))
+    proof_text = join_items_for_prompt(flatten_text_items(insights.get("proof_points", [])))
+    value_text = join_items_for_prompt(flatten_text_items(insights.get("value_props", [])))
+    cta_text = join_items_for_prompt(flatten_text_items(insights.get("ctas", [])))
+
+    normalized_payload = call_ad_strategy_llm(
+        ad_flow_text,
+        pain_text,
+        proof_text,
+        value_text,
+        cta_text,
+        goal,
+    )
+
+    raw_response = getattr(call_ad_strategy_llm, "last_raw_response", None)
+    if raw_response and normalized_payload:
+        raw_path.write_text(
+            json.dumps({"raw_response": raw_response}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    if normalized_payload:
+        strategy_path.write_text(
+            json.dumps(normalized_payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return build_strategy_display_payload(normalized_payload)
+    return None
+
+
 def render_voiceover_output(voiceover_path: Path | None, voiceover_debug: Dict[str, Any] | None) -> None:
     if voiceover_debug:
         if voiceover_path is None:
@@ -1725,6 +2179,16 @@ def render_generated_ad_preview(
     st.caption("Generated storyboard video preview")
     scene_sources = preview_debug.get("scene_sources", []) if preview_debug else []
     if scene_sources:
+        pollinations_balance_issue = any(
+            "Insufficient balance" in str((scene.get("pollinations_debug", {}) or {}).get("response_body", ""))
+            or str((scene.get("pollinations_debug", {}) or {}).get("status_code", "")) == "402"
+            for scene in scene_sources
+        )
+        all_fallback_cards = all(str(scene.get("source", "")).strip() == "fallback card" for scene in scene_sources)
+        if pollinations_balance_issue and all_fallback_cards:
+            st.warning(
+                "AI scene generation unavailable: Pollinations balance is exhausted. Showing fallback storyboard cards."
+            )
         with st.expander("Scene rendering details"):
             for scene in scene_sources:
                 st.write(f"- {scene.get('stage', 'Scene')}: {scene.get('source', 'fallback card')}")
@@ -1748,7 +2212,12 @@ def render_generated_ad_preview(
     )
 
 
-def render_pipeline_results(job_dir: Path, logs: str = "", from_saved: bool = False) -> None:
+def render_pipeline_results(
+    job_dir: Path,
+    logs: str = "",
+    from_saved: bool = False,
+    goal: Optional[str] = None,
+) -> None:
     pipeline_output = load_pipeline_output(job_dir)
     if pipeline_output and pipeline_output.get("status") == "placeholder":
         st.error("Analysis incomplete. Please retry.")
@@ -1767,6 +2236,8 @@ def render_pipeline_results(job_dir: Path, logs: str = "", from_saved: bool = Fa
 
     if from_saved:
         st.caption(f"Showing latest saved analysis: {job_dir.name}")
+
+    campaign_goal = goal or st.session_state.get("last_campaign_goal") or "Lead Generation"
 
     st.subheader("Common Patterns Across Ads")
     patterns = build_pattern_summary(ad_results)
@@ -1863,12 +2334,18 @@ def render_pipeline_results(job_dir: Path, logs: str = "", from_saved: bool = Fa
             )
             continue
 
+        strategy_payload: Optional[Dict[str, Any]] = None
         normalized_payload = load_strategy_payload(item["dir"])
-        if not isinstance(normalized_payload, dict):
+        if isinstance(normalized_payload, dict):
+            strategy_payload = build_strategy_display_payload(normalized_payload)
+        else:
+            with st.spinner(f"Crafting strategy for {ad_name}"):
+                strategy_payload = ensure_strategy_payload_for_item(item, campaign_goal)
+
+        if not strategy_payload:
             st.info(f"No saved recipe found for {ad_name}. Run Analyze Ads to generate strategy.")
             continue
 
-        strategy_payload = build_strategy_display_payload(normalized_payload)
         has_script_content = any(
             str(strategy_payload.get("script", {}).get(key, "")).strip()
             for key in ("hook", "proof", "value", "cta")
@@ -1879,7 +2356,7 @@ def render_pipeline_results(job_dir: Path, logs: str = "", from_saved: bool = Fa
             continue
 
         render_strategy_card(ad_name, strategy_payload)
-        voiceover_path, voiceover_debug = ensure_voiceover(job_dir, strategy_payload.get("script", {}))
+        voiceover_path, voiceover_debug = ensure_voiceover(job_dir, strategy_payload)
         render_voiceover_output(voiceover_path, voiceover_debug)
         if not preview_rendered:
             render_generated_ad_preview(job_dir, strategy_payload, voiceover_path)
@@ -2039,6 +2516,7 @@ with st.form("fastads_input_form"):
     submitted = st.form_submit_button("Analyze Ads")
 
 if submitted:
+    st.session_state.last_campaign_goal = goal
     selected_video_path = st.session_state.get("selected_video_path")
 
     if not uploads and not selected_video_path:
@@ -2299,9 +2777,7 @@ if submitted:
 
                             voiceover_path: Path | None = None
                             voiceover_debug: Dict[str, Any] | None = None
-                            voiceover_path, voiceover_debug = ensure_voiceover(
-                                job_dir, strategy_payload.get("script", {})
-                            )
+                            voiceover_path, voiceover_debug = ensure_voiceover(job_dir, strategy_payload)
                             render_voiceover_output(voiceover_path, voiceover_debug)
 
                     with st.expander("Pipeline logs"):
@@ -2318,4 +2794,4 @@ else:
 
     if restored_job:
         st.divider()
-        render_pipeline_results(restored_job, from_saved=True)
+        render_pipeline_results(restored_job, from_saved=True, goal=st.session_state.get("last_campaign_goal"))
