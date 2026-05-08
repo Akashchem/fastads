@@ -18,7 +18,6 @@ import edge_tts
 import httpx
 import streamlit as st
 from dotenv import load_dotenv
-from fastads.providers.llm import call_ad_strategy_llm
 from googleapiclient.discovery import build
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 import yt_dlp
@@ -29,16 +28,63 @@ load_dotenv()
 PROJECT_ROOT = Path(__file__).resolve().parent
 DATA_JOBS_DIR = PROJECT_ROOT / "data" / "jobs"
 UPLOADS_DIR = PROJECT_ROOT / "data" / "ui_uploads"
-YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
-META_ACCESS_TOKEN = os.getenv("META_ACCESS_TOKEN", "").strip()
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "").strip()
+DATA_JOBS_DIR.mkdir(parents=True, exist_ok=True)
+UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def get_setting(name: str, default: str = "") -> str:
+    value = os.getenv(name, "").strip()
+    if value:
+        return value
+    try:
+        secrets = getattr(st, "secrets", None)
+        if secrets is not None:
+            secret_value = secrets.get(name, default)
+            if secret_value is None:
+                return default
+            return str(secret_value).strip()
+    except Exception:
+        pass
+    return default
+
+
+def bootstrap_env_from_secrets(names: List[str]) -> None:
+    for name in names:
+        if os.getenv(name, "").strip():
+            continue
+        value = get_setting(name, "")
+        if value:
+            os.environ[name] = value
+
+
+bootstrap_env_from_secrets(
+    [
+        "YOUTUBE_API_KEY",
+        "META_ACCESS_TOKEN",
+        "ELEVENLABS_API_KEY",
+        "MINIMAX_API_KEY",
+        "MINIMAX_GROUP_ID",
+        "POLLINATIONS_API_KEY",
+        "WHISPER_API_URL",
+        "WHISPER_AUTH_TOKEN",
+        "OPENAI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "AZURE_OPENAI_API_KEY",
+    ]
+)
+
+from fastads.providers.llm import call_ad_strategy_llm
+
+YOUTUBE_API_KEY = get_setting("YOUTUBE_API_KEY")
+META_ACCESS_TOKEN = get_setting("META_ACCESS_TOKEN")
+ELEVENLABS_API_KEY = get_setting("ELEVENLABS_API_KEY")
 ELEVENLABS_VOICE_ID = "21m00Tcm4TlvDq8ikWAM"
-MINIMAX_API_KEY = os.getenv("MINIMAX_API_KEY", "").strip()
-MINIMAX_GROUP_ID = os.getenv("MINIMAX_GROUP_ID", "").strip()
+MINIMAX_API_KEY = get_setting("MINIMAX_API_KEY")
+MINIMAX_GROUP_ID = get_setting("MINIMAX_GROUP_ID")
 MINIMAX_VOICE_ID = "English_expressive_narrator"
 EDGE_TTS_EN_VOICE = "en-IN-NeerjaNeural"
 EDGE_TTS_HI_VOICE = "hi-IN-SwaraNeural"
-POLLINATIONS_API_KEY = os.getenv("POLLINATIONS_API_KEY", "").strip()
+POLLINATIONS_API_KEY = get_setting("POLLINATIONS_API_KEY")
 
 
 def run_pipeline(input_json_path: Path, competitor: str, market: str = "IN") -> tuple[bool, str]:
