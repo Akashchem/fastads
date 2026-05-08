@@ -7,6 +7,7 @@ import shutil
 import uuid
 import subprocess
 import asyncio
+import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
@@ -85,6 +86,49 @@ MINIMAX_VOICE_ID = "English_expressive_narrator"
 EDGE_TTS_EN_VOICE = "en-IN-NeerjaNeural"
 EDGE_TTS_HI_VOICE = "hi-IN-SwaraNeural"
 POLLINATIONS_API_KEY = get_setting("POLLINATIONS_API_KEY")
+REMOTE_CALL_TIMEOUT_SECONDS = 45.0
+REMOTE_CALL_RETRIES = 1
+
+
+def _retry_once(operation, *, on_retry=None):
+    last_exc: Exception | None = None
+    for attempt in range(REMOTE_CALL_RETRIES + 1):
+        try:
+            return operation()
+        except Exception as exc:
+            last_exc = exc
+            if attempt < REMOTE_CALL_RETRIES:
+                if callable(on_retry):
+                    try:
+                        on_retry(attempt + 1, exc)
+                    except Exception:
+                        pass
+                continue
+            break
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("Remote call failed unexpectedly.")
+
+
+def _retry_once_allow_none(operation, *, on_retry=None):
+    last_exc: Exception | None = None
+    last_result: Any = None
+    for attempt in range(REMOTE_CALL_RETRIES + 1):
+        try:
+            result = operation()
+            if result is not None:
+                return result
+            last_result = result
+        except Exception as exc:
+            last_exc = exc
+        if attempt < REMOTE_CALL_RETRIES and callable(on_retry):
+            try:
+                on_retry(attempt + 1, last_exc or RuntimeError("Empty remote response"))
+            except Exception:
+                pass
+    if last_exc is not None:
+        raise last_exc
+    return last_result
 
 
 def run_pipeline(input_json_path: Path, competitor: str, market: str = "IN") -> tuple[bool, str]:
@@ -515,7 +559,11 @@ async def generate_voiceover_edge_tts(narration_text: str, output_path: Path, vo
     await communicate.save(str(output_path))
 
 
-def ensure_voiceover(job_dir: Path, strategy_payload: Dict[str, Any]) -> tuple[Path | None, Dict[str, Any] | None]:
+def ensure_voiceover(
+    job_dir: Path,
+    strategy_payload: Dict[str, Any],
+    status: Any | None = None,
+) -> tuple[Path | None, Dict[str, Any] | None]:
     voiceover_path = job_dir / "voiceover.mp3"
     voice_meta_path = job_dir / "voiceover.voice.txt"
     voice_meta_json_path = job_dir / "voiceover.meta.json"
@@ -531,6 +579,8 @@ def ensure_voiceover(job_dir: Path, strategy_payload: Dict[str, Any]) -> tuple[P
         }
 
     try:
+        if status is not None:
+            status.write("Step 3: Generating voiceover")
         selected_voice = select_edge_tts_voice(narration_text)
         cache_signature = _voiceover_cache_signature(strategy_payload)
 
@@ -550,7 +600,9 @@ def ensure_voiceover(job_dir: Path, strategy_payload: Dict[str, Any]) -> tuple[P
         if voice_meta_json_path.exists():
             voice_meta_json_path.unlink(missing_ok=True)
 
-        asyncio.run(generate_voiceover_edge_tts(narration_text, voiceover_path, selected_voice))
+        _retry_once(
+            lambda: asyncio.run(generate_voiceover_edge_tts(narration_text, voiceover_path, selected_voice))
+        )
         if _valid_audio_file(voiceover_path):
             voice_meta_path.write_text(selected_voice, encoding="utf-8")
             voice_meta_json_path.write_text(
@@ -583,7 +635,8 @@ def ensure_voiceover(job_dir: Path, strategy_payload: Dict[str, Any]) -> tuple[P
         return None, {
             "provider": "Edge TTS",
             "message": "Edge TTS generation failed",
-            "exception": str(exc),
+            "exception": f"{type(exc).__name__}: {exc}",
+            "traceback": traceback.format_exc(),
             "status_code": "",
             "response_body": "",
         }
@@ -1139,14 +1192,21 @@ def _pollinations_request_scene_image(prompt: str, output_path: Path) -> tuple[b
     }
 
     try:
-        response = httpx.get(
-            url,
-            params={"width": 1080, "height": 1920, "nologo": "true", "model": "flux"},
-            headers=headers,
-            timeout=90.0,
+        response = _retry_once(
+            lambda: httpx.get(
+                url,
+                params={"width": 1080, "height": 1920, "nologo": "true", "model": "flux"},
+                headers=headers,
+                timeout=REMOTE_CALL_TIMEOUT_SECONDS,
+            ),
+            on_retry=lambda attempt, exc: debug.update(
+                {
+                    "exception": f"Retry {attempt} after {type(exc).__name__}: {exc}",
+                }
+            ),
         )
-    except httpx.HTTPError:
-        debug["exception"] = "Request failed"
+    except Exception as exc:
+        debug["exception"] = f"{type(exc).__name__}: {exc}"
         return False, debug
 
     if response.status_code in (401, 402):
@@ -1369,8 +1429,40 @@ def _render_storyboard_scene_image(
     image.convert("RGB").save(output_path)
 
 
-def _run_ffmpeg_command(args: List[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(args, check=False, capture_output=True, text=True)
+def _run_ffmpeg_command(
+    args: List[str],
+    debug: Dict[str, Any] | None = None,
+    label: str = "",
+) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(args, check=False, capture_output=True, text=True)
+    if debug is not None:
+        debug.setdefault("ffmpeg_commands", []).append(
+            {
+                "label": label or "ffmpeg",
+                "cmd": args,
+                "returncode": result.returncode,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+            }
+        )
+    return result
+
+
+def _get_ffmpeg_version() -> str:
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-version"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.stdout:
+            return result.stdout.splitlines()[0].strip()
+        if result.stderr:
+            return result.stderr.splitlines()[0].strip()
+    except Exception as exc:
+        return f"Unavailable: {exc}"
+    return "Unavailable"
 
 
 def _generate_storyboard_preview_with_ffmpeg(
@@ -1378,6 +1470,7 @@ def _generate_storyboard_preview_with_ffmpeg(
     durations: List[float],
     preview_path: Path,
     voiceover_path: Path | None,
+    debug: Dict[str, Any] | None = None,
 ) -> None:
     preview_path.unlink(missing_ok=True)
     render_id = uuid.uuid4().hex[:10]
@@ -1418,7 +1511,7 @@ def _generate_storyboard_preview_with_ffmpeg(
                 "-an",
                 str(scene_video_path),
             ]
-            result = _run_ffmpeg_command(scene_cmd)
+            result = _run_ffmpeg_command(scene_cmd, debug=debug, label=f"scene:{scene_path.name}")
             if result.returncode != 0:
                 raise RuntimeError(result.stderr.strip() or "Failed to create scene clip.")
             if not scene_video_path.exists() or scene_video_path.stat().st_size <= 10 * 1024:
@@ -1473,7 +1566,7 @@ def _generate_storyboard_preview_with_ffmpeg(
             concat_cmd.extend(["-an"])
         concat_cmd.append(str(preview_path))
 
-        result = _run_ffmpeg_command(concat_cmd)
+        result = _run_ffmpeg_command(concat_cmd, debug=debug, label="final_preview")
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip() or "Failed to build storyboard preview.")
 
@@ -1489,11 +1582,26 @@ def ensure_generated_ad_preview(
     job_dir: Path,
     strategy_payload: Dict[str, Any],
     voiceover_path: Path | None,
+    status: Any | None = None,
 ) -> tuple[Path | None, Dict[str, Any] | None]:
     preview_path = job_dir / "generated_ad_preview.mp4"
     scenes_dir = job_dir / "scenes"
     scene_manifest_path = job_dir / "generated_ad_preview.scenes.json"
     voice_meta_json_path = job_dir / "voiceover.meta.json"
+    debug: Dict[str, Any] = {
+        "provider": "ffmpeg",
+        "cwd": str(Path.cwd()),
+        "job_id": job_dir.name,
+        "ffmpeg_version": _get_ffmpeg_version(),
+        "scene_sources": [],
+        "ffmpeg_commands": [],
+        "scene_paths": [],
+        "scene_sizes": [],
+        "stdout": "",
+        "stderr": "",
+        "exception": "",
+        "traceback": "",
+    }
     current_voice_signature = ""
     voice_meta = load_json(voice_meta_json_path)
     if isinstance(voice_meta, dict):
@@ -1517,28 +1625,29 @@ def ensure_generated_ad_preview(
                     for item in manifest.get("scenes", [])
                 )
             ):
-                return preview_path, {"provider": "cached", "scene_sources": manifest.get("scenes", [])}
+                debug.update({"provider": "cached", "scene_sources": manifest.get("scenes", [])})
+                return preview_path, debug
         except Exception:
             pass
 
     scenes = _storyboard_scene_entries(strategy_payload)
     if not scenes:
-        return None, {
-            "provider": "ffmpeg",
-            "message": "No storyboard stages available for preview generation.",
-            "exception": "",
-            "status_code": "",
-            "response_body": "",
-        }
+        debug["message"] = "No storyboard stages available for preview generation."
+        return None, debug
 
     scenes_dir.mkdir(parents=True, exist_ok=True)
     for child in scenes_dir.iterdir():
         if child.is_file():
             child.unlink(missing_ok=True)
 
+    if status is not None:
+        status.write("Step 1: Preparing scenes")
+
     scene_paths: List[Path] = []
-    scene_sources: List[Dict[str, str]] = []
+    scene_sources: List[Dict[str, Any]] = []
     for index, scene in enumerate(scenes, start=1):
+        if status is not None:
+            status.write(f"Step 2: Generating images ({index}/{len(scenes)})")
         scene_path = scenes_dir / f"scene_{index:02d}_{scene['stage'].lower()}.png"
         background_path = scenes_dir / f"scene_{index:02d}_{scene['stage'].lower()}_ai.png"
         prompt_path = scenes_dir / f"scene_{index:02d}_{scene['stage'].lower()}_ai.prompt.txt"
@@ -1575,6 +1684,7 @@ def ensure_generated_ad_preview(
         else:
             _render_storyboard_scene_image(scene, scene_path, None)
         scene_paths.append(scene_path)
+        scene_size = scene_path.stat().st_size if scene_path.exists() else 0
         scene_sources.append(
             {
                 "stage": str(scene.get("label") or scene.get("stage", "")).strip().title(),
@@ -1582,12 +1692,17 @@ def ensure_generated_ad_preview(
                 "image_path": str(background_path if used_source == "AI image" else scene_path),
                 "pollinations_debug": pollinations_debug if used_source == "AI image" or pollinations_debug else {},
                 "scene_path": str(scene_path),
+                "scene_size": scene_size,
             }
         )
+        debug["scene_paths"].append(str(scene_path))
+        debug["scene_sizes"].append({"path": str(scene_path), "size_bytes": scene_size})
 
     try:
+        if status is not None:
+            status.write("Step 4: Rendering video")
         durations = [float(SCENE_DURATIONS.get(scene["stage"], 4)) for scene in scenes]
-        _generate_storyboard_preview_with_ffmpeg(scene_paths, durations, preview_path, voiceover_path)
+        _generate_storyboard_preview_with_ffmpeg(scene_paths, durations, preview_path, voiceover_path, debug=debug)
         if _valid_preview(preview_path):
             try:
                 scene_manifest_path.write_text(
@@ -1604,28 +1719,31 @@ def ensure_generated_ad_preview(
                 )
             except Exception:
                 pass
-            return preview_path, {"provider": "ffmpeg", "scene_sources": scene_sources}
+            debug["scene_sources"] = scene_sources
+            return preview_path, debug
         if preview_path.exists():
             preview_path.unlink(missing_ok=True)
-        return None, {
-            "provider": "ffmpeg",
-            "message": "Generated storyboard preview was empty or too small.",
-            "scene_sources": scene_sources,
-            "exception": "",
-            "status_code": "",
-            "response_body": "",
-        }
+        debug.update(
+            {
+                "message": "Generated storyboard preview was empty or too small.",
+                "scene_sources": scene_sources,
+            }
+        )
+        return None, debug
     except Exception as exc:
         if preview_path.exists():
             preview_path.unlink(missing_ok=True)
-        return None, {
-            "provider": "ffmpeg",
-            "message": "Storyboard preview generation failed.",
-            "scene_sources": scene_sources,
-            "exception": str(exc),
-            "status_code": "",
-            "response_body": "",
-        }
+        debug.update(
+            {
+                "message": "Storyboard preview generation failed.",
+                "scene_sources": scene_sources,
+                "exception": f"{type(exc).__name__}: {exc}",
+                "traceback": traceback.format_exc(),
+                "stdout": getattr(exc, "stdout", "") if hasattr(exc, "stdout") else "",
+                "stderr": getattr(exc, "stderr", "") if hasattr(exc, "stderr") else "",
+            }
+        )
+        return None, debug
 
 
 def search_meta_ads(competitor_name: str, country: str = "IN", limit: int = 6) -> List[Dict[str, Any]]:
@@ -2134,13 +2252,15 @@ def ensure_strategy_payload_for_item(item: Dict[str, Any], goal: str) -> Optiona
     value_text = join_items_for_prompt(flatten_text_items(insights.get("value_props", [])))
     cta_text = join_items_for_prompt(flatten_text_items(insights.get("ctas", [])))
 
-    normalized_payload = call_ad_strategy_llm(
-        ad_flow_text,
-        pain_text,
-        proof_text,
-        value_text,
-        cta_text,
-        goal,
+    normalized_payload = _retry_once_allow_none(
+        lambda: call_ad_strategy_llm(
+            ad_flow_text,
+            pain_text,
+            proof_text,
+            value_text,
+            cta_text,
+            goal,
+        )
     )
 
     raw_response = getattr(call_ad_strategy_llm, "last_raw_response", None)
@@ -2168,6 +2288,7 @@ def render_voiceover_output(voiceover_path: Path | None, voiceover_debug: Dict[s
             or voiceover_debug.get("exception")
             or voiceover_debug.get("response_body")
             or voiceover_debug.get("status_code")
+            or voiceover_debug.get("traceback")
         ):
             with st.expander("Voice generation debug details"):
                 st.json(
@@ -2176,6 +2297,7 @@ def render_voiceover_output(voiceover_path: Path | None, voiceover_debug: Dict[s
                         "status_code": voiceover_debug.get("status_code", ""),
                         "response_body": voiceover_debug.get("response_body", ""),
                         "exception": voiceover_debug.get("exception", ""),
+                        "traceback": voiceover_debug.get("traceback", ""),
                         "providers": provider_errors or [],
                     }
                 )
@@ -2208,14 +2330,48 @@ def render_generated_ad_preview(
     job_dir: Path,
     strategy_payload: Dict[str, Any],
     voiceover_path: Path | None,
+    status: Any | None = None,
 ) -> None:
     st.subheader("Generated Storyboard Video Preview")
-    preview_path, preview_debug = ensure_generated_ad_preview(job_dir, strategy_payload, voiceover_path)
+    preview_path, preview_debug = ensure_generated_ad_preview(
+        job_dir,
+        strategy_payload,
+        voiceover_path,
+        status=status,
+    )
     if preview_debug and preview_path is None:
-        st.warning(preview_debug.get("message", "Generated storyboard preview failed."))
-        if preview_debug.get("exception"):
-            with st.expander("Preview debug details"):
-                st.json(preview_debug)
+        error_message = preview_debug.get("exception") or preview_debug.get("message") or "Generated storyboard preview failed."
+        st.error(error_message)
+        with st.expander("Storyboard generation debug"):
+            st.write(f"Current working directory: {preview_debug.get('cwd', Path.cwd())}")
+            st.write(f"Job ID: {preview_debug.get('job_id', job_dir.name)}")
+            ffmpeg_version = preview_debug.get("ffmpeg_version", "Unavailable")
+            st.write(f"ffmpeg availability: {ffmpeg_version}")
+            scene_sources = preview_debug.get("scene_sources", []) or []
+            if scene_sources:
+                st.write("Scene paths and sizes:")
+                for scene in scene_sources:
+                    st.write(
+                        f"- {scene.get('stage', 'Scene')}: {scene.get('scene_path', '')} "
+                        f"({scene.get('scene_size', 0)} bytes)"
+                    )
+            ffmpeg_commands = preview_debug.get("ffmpeg_commands", []) or []
+            if ffmpeg_commands:
+                st.write("ffmpeg commands:")
+                for entry in ffmpeg_commands:
+                    st.code(" ".join(map(str, entry.get("cmd", []))), language="bash")
+                    if entry.get("stdout"):
+                        st.write("stdout:")
+                        st.code(str(entry.get("stdout")), language="text")
+                    if entry.get("stderr"):
+                        st.write("stderr:")
+                        st.code(str(entry.get("stderr")), language="text")
+            if preview_debug.get("exception"):
+                st.write("Exception:")
+                st.code(str(preview_debug.get("exception")), language="text")
+            if preview_debug.get("traceback"):
+                st.write("Traceback:")
+                st.code(str(preview_debug.get("traceback")), language="text")
         return
 
     if not preview_path or not preview_path.exists():
@@ -2248,6 +2404,34 @@ def render_generated_ad_preview(
                             json.dumps(pollinations_debug, ensure_ascii=False, indent=2),
                             language="json",
                         )
+    if preview_debug:
+        with st.expander("Storyboard generation debug"):
+            st.write(f"Current working directory: {preview_debug.get('cwd', Path.cwd())}")
+            st.write(f"Job ID: {preview_debug.get('job_id', job_dir.name)}")
+            st.write(f"ffmpeg availability: {preview_debug.get('ffmpeg_version', 'Unavailable')}")
+            scene_sizes = preview_debug.get("scene_sizes", []) or []
+            if scene_sizes:
+                st.write("Scene paths and sizes:")
+                for item in scene_sizes:
+                    st.write(f"- {item.get('path', '')} ({item.get('size_bytes', 0)} bytes)")
+            ffmpeg_commands = preview_debug.get("ffmpeg_commands", []) or []
+            if ffmpeg_commands:
+                st.write("ffmpeg commands:")
+                for entry in ffmpeg_commands:
+                    st.write(f"- {entry.get('label', 'ffmpeg')}")
+                    st.code(" ".join(map(str, entry.get("cmd", []))), language="bash")
+                    if entry.get("stdout"):
+                        st.write("stdout:")
+                        st.code(str(entry.get("stdout")), language="text")
+                    if entry.get("stderr"):
+                        st.write("stderr:")
+                        st.code(str(entry.get("stderr")), language="text")
+            if preview_debug.get("exception"):
+                st.write("Exception:")
+                st.code(str(preview_debug.get("exception")), language="text")
+            if preview_debug.get("traceback"):
+                st.write("Traceback:")
+                st.code(str(preview_debug.get("traceback")), language="text")
     st.video(str(preview_path))
     st.download_button(
         "Download Preview",
@@ -2402,11 +2586,19 @@ def render_pipeline_results(
             continue
 
         render_strategy_card(ad_name, strategy_payload)
-        voiceover_path, voiceover_debug = ensure_voiceover(job_dir, strategy_payload)
+        storyboard_status = st.status(f"Preparing storyboard assets for {ad_name}...", expanded=True)
+        storyboard_status.write("Step 1: Preparing scenes")
+        storyboard_status.write("Step 2: Generating images")
+        storyboard_status.write("Step 3: Generating voiceover")
+        voiceover_path, voiceover_debug = ensure_voiceover(job_dir, strategy_payload, status=storyboard_status)
         render_voiceover_output(voiceover_path, voiceover_debug)
         if not preview_rendered:
-            render_generated_ad_preview(job_dir, strategy_payload, voiceover_path)
+            storyboard_status.write("Step 4: Rendering video")
+            render_generated_ad_preview(job_dir, strategy_payload, voiceover_path, status=storyboard_status)
+            storyboard_status.update(label=f"Storyboard ready for {ad_name}", state="complete", expanded=False)
             preview_rendered = True
+        else:
+            storyboard_status.update(label=f"Storyboard assets ready for {ad_name}", state="complete", expanded=False)
 
     if logs:
         with st.expander("Pipeline logs"):
@@ -2769,13 +2961,15 @@ if submitted:
                                 st.json(prompt_payload)
 
                             with st.spinner(f"Crafting strategy for {ad_name}"):
-                                normalized_payload = call_ad_strategy_llm(
-                                    ad_flow_text,
-                                    pain_text,
-                                    proof_text,
-                                    value_text,
-                                    cta_text,
-                                    goal,
+                                normalized_payload = _retry_once_allow_none(
+                                    lambda: call_ad_strategy_llm(
+                                        ad_flow_text,
+                                        pain_text,
+                                        proof_text,
+                                        value_text,
+                                        cta_text,
+                                        goal,
+                                    )
                                 )
 
                             raw_response = getattr(call_ad_strategy_llm, "last_raw_response", None)

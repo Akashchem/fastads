@@ -151,6 +151,7 @@ def _call_chat_completion(
                 api_key=AZURE_OPENAI_API_KEY,
                 azure_endpoint=AZURE_OPENAI_ENDPOINT,
                 api_version=AZURE_OPENAI_API_VERSION,
+                timeout=45.0,
             )
             kwargs = {
                 "model": AZURE_OPENAI_DEPLOYMENT,
@@ -166,7 +167,7 @@ def _call_chat_completion(
         return response.choices[0].message.content or ""
 
     try:
-        with httpx.Client(timeout=20.0) as client:
+        with httpx.Client(timeout=45.0) as client:
             payload = {
                 "model": FASTADS_LLM_MODEL,
                 "temperature": 0,
