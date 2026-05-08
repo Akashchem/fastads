@@ -2518,11 +2518,14 @@ def render_generated_ad_preview(
 def render_workflow_strip() -> None:
     st.markdown(
         """
-        <div style="display:flex; gap:10px; flex-wrap:wrap; margin: 8px 0 16px 0;">
-            <span style="padding:8px 12px; border-radius:999px; background:rgba(84,130,255,0.10); border:1px solid rgba(84,130,255,0.20); font-weight:600;">Find ad</span>
-            <span style="padding:8px 12px; border-radius:999px; background:rgba(84,130,255,0.10); border:1px solid rgba(84,130,255,0.20); font-weight:600;">Decode</span>
-            <span style="padding:8px 12px; border-radius:999px; background:rgba(84,130,255,0.10); border:1px solid rgba(84,130,255,0.20); font-weight:600;">Generate script</span>
-            <span style="padding:8px 12px; border-radius:999px; background:rgba(84,130,255,0.10); border:1px solid rgba(84,130,255,0.20); font-weight:600;">Preview video</span>
+        <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin: 8px 0 16px 0; color: rgba(49, 51, 63, 0.78);">
+            <span style="padding:7px 11px; border-radius:999px; background:rgba(84,130,255,0.06); border:1px solid rgba(84,130,255,0.12); font-weight:500;">Find ad</span>
+            <span style="font-weight:700; color: rgba(49, 51, 63, 0.48);">→</span>
+            <span style="padding:7px 11px; border-radius:999px; background:rgba(84,130,255,0.06); border:1px solid rgba(84,130,255,0.12); font-weight:500;">Decode</span>
+            <span style="font-weight:700; color: rgba(49, 51, 63, 0.48);">→</span>
+            <span style="padding:7px 11px; border-radius:999px; background:rgba(84,130,255,0.06); border:1px solid rgba(84,130,255,0.12); font-weight:500;">Generate script</span>
+            <span style="font-weight:700; color: rgba(49, 51, 63, 0.48);">→</span>
+            <span style="padding:7px 11px; border-radius:999px; background:rgba(84,130,255,0.06); border:1px solid rgba(84,130,255,0.12); font-weight:500;">Preview video</span>
         </div>
         """,
         unsafe_allow_html=True,
@@ -2530,11 +2533,7 @@ def render_workflow_strip() -> None:
 
 
 def render_hero_ctas() -> None:
-    hero_col1, hero_col2 = st.columns(2)
-    with hero_col1:
-        st.button("Analyze a competitor ad", use_container_width=True, key="hero-analyze-cta")
-    with hero_col2:
-        st.button("Upload your own video", use_container_width=True, key="hero-upload-cta")
+    st.button("Analyze a competitor ad", use_container_width=True, key="hero-analyze-cta")
 
 
 def render_pipeline_results(
