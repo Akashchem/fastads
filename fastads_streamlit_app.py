@@ -1478,7 +1478,9 @@ def _generate_storyboard_preview_with_ffmpeg(
     temp_render_dir.mkdir(parents=True, exist_ok=True)
     scene_video_paths: List[Path] = []
     transition_duration = 0.6
-    fps = 24
+    fps = 30
+    combined_path = temp_render_dir / "combined.mp4"
+    concat_list_path = temp_render_dir / "concat_list.txt"
 
     try:
         for scene_path, duration in zip(scene_paths, durations):
@@ -1492,18 +1494,25 @@ def _generate_storyboard_preview_with_ffmpeg(
                 "1",
                 "-i",
                 str(scene_path),
+                "-t",
+                str(duration),
+                "-r",
+                str(fps),
                 "-vf",
                 (
                     "scale=1080:1920:force_original_aspect_ratio=increase,"
                     "crop=1080:1920,"
                     "zoompan=z='min(zoom+0.0015,1.08)':d="
                     f"{frame_count}:s=1080x1920:fps={fps},"
-                    "fade=t=in:st=0:d=0.5,format=yuv420p"
+                    "fade=t=in:st=0:d=0.5,"
+                    "format=yuv420p,fps=30"
                 ),
                 "-c:v",
                 "libx264",
-                "-t",
-                str(duration),
+                "-preset",
+                "medium",
+                "-crf",
+                "20",
                 "-pix_fmt",
                 "yuv420p",
                 "-r",
@@ -1523,7 +1532,9 @@ def _generate_storyboard_preview_with_ffmpeg(
 
         filter_parts: List[str] = []
         for index in range(len(scene_video_paths)):
-            filter_parts.append(f"[{index}:v]setpts=PTS-STARTPTS[v{index}]")
+            filter_parts.append(
+                f"[{index}:v]setpts=PTS-STARTPTS,fps={fps},scale=1080:1920,format=yuv420p[v{index}]"
+            )
 
         if len(scene_video_paths) == 1:
             filter_parts.append("[v0]null[v]")
@@ -1564,11 +1575,73 @@ def _generate_storyboard_preview_with_ffmpeg(
             concat_cmd.extend(["-c:a", "aac"])
         else:
             concat_cmd.extend(["-an"])
+        concat_cmd.extend(["-c:v", "libx264", "-preset", "medium", "-crf", "20", "-r", str(fps), "-pix_fmt", "yuv420p"])
         concat_cmd.append(str(preview_path))
 
         result = _run_ffmpeg_command(concat_cmd, debug=debug, label="final_preview")
         if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip() or "Failed to build storyboard preview.")
+            if debug is not None:
+                debug["xfade_stderr"] = result.stderr
+            fallback_cmd = [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(concat_list_path),
+                "-c:v",
+                "libx264",
+                "-preset",
+                "medium",
+                "-crf",
+                "20",
+                "-r",
+                str(fps),
+                "-pix_fmt",
+                "yuv420p",
+                str(combined_path),
+            ]
+            concat_list_path.write_text(
+                "\n".join(f"file '{path.as_posix()}'" for path in scene_video_paths) + "\n",
+                encoding="utf-8",
+            )
+            fallback_result = _run_ffmpeg_command(fallback_cmd, debug=debug, label="fallback_concat")
+            if fallback_result.returncode != 0:
+                raise RuntimeError(
+                    fallback_result.stderr.strip()
+                    or result.stderr.strip()
+                    or "Failed to build storyboard preview."
+                )
+            if voiceover_path and voiceover_path.exists() and voiceover_path.stat().st_size > 10 * 1024:
+                mux_cmd = [
+                    "ffmpeg",
+                    "-y",
+                    "-i",
+                    str(combined_path),
+                    "-i",
+                    str(voiceover_path),
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "medium",
+                    "-crf",
+                    "20",
+                    "-r",
+                    str(fps),
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-c:a",
+                    "aac",
+                    "-shortest",
+                    str(preview_path),
+                ]
+                mux_result = _run_ffmpeg_command(mux_cmd, debug=debug, label="final_mux")
+                if mux_result.returncode != 0:
+                    raise RuntimeError(mux_result.stderr.strip() or "Failed to add voiceover to storyboard preview.")
+            else:
+                shutil.move(str(combined_path), str(preview_path))
 
         if not preview_path.exists() or preview_path.stat().st_size <= 50 * 1024:
             raise RuntimeError("Generated storyboard preview was empty or too small.")
@@ -2188,7 +2261,7 @@ def _copy_script_line(ad_name: str, label: str, text: str) -> None:
 
 
 def _render_script_block(script: Dict[str, Any], ad_name: str) -> None:
-    st.write("**Script**")
+    st.write("**Script & Voiceover**")
     script_columns = st.columns(4)
     script_labels = [
         ("hook", "Hook"),
@@ -2290,7 +2363,7 @@ def render_voiceover_output(voiceover_path: Path | None, voiceover_debug: Dict[s
             or voiceover_debug.get("status_code")
             or voiceover_debug.get("traceback")
         ):
-            with st.expander("Voice generation debug details"):
+            with st.expander("Script & Voiceover debug details"):
                 st.json(
                     {
                         "provider": voiceover_debug.get("provider", ""),
@@ -2332,7 +2405,7 @@ def render_generated_ad_preview(
     voiceover_path: Path | None,
     status: Any | None = None,
 ) -> None:
-    st.subheader("Generated Storyboard Video Preview")
+    st.subheader("Video Preview")
     preview_path, preview_debug = ensure_generated_ad_preview(
         job_dir,
         strategy_payload,
@@ -2342,7 +2415,7 @@ def render_generated_ad_preview(
     if preview_debug and preview_path is None:
         error_message = preview_debug.get("exception") or preview_debug.get("message") or "Generated storyboard preview failed."
         st.error(error_message)
-        with st.expander("Storyboard generation debug"):
+        with st.expander("Video Preview debug"):
             st.write(f"Current working directory: {preview_debug.get('cwd', Path.cwd())}")
             st.write(f"Job ID: {preview_debug.get('job_id', job_dir.name)}")
             ffmpeg_version = preview_debug.get("ffmpeg_version", "Unavailable")
@@ -2378,7 +2451,7 @@ def render_generated_ad_preview(
         st.info("Generated storyboard video preview is not available yet.")
         return
 
-    st.caption("Generated storyboard video preview")
+    st.caption("This is an AI-generated storyboard preview. Use it as a production brief or first draft.")
     scene_sources = preview_debug.get("scene_sources", []) if preview_debug else []
     if scene_sources:
         pollinations_balance_issue = any(
@@ -2442,6 +2515,28 @@ def render_generated_ad_preview(
     )
 
 
+def render_workflow_strip() -> None:
+    st.markdown(
+        """
+        <div style="display:flex; gap:10px; flex-wrap:wrap; margin: 8px 0 16px 0;">
+            <span style="padding:8px 12px; border-radius:999px; background:rgba(84,130,255,0.10); border:1px solid rgba(84,130,255,0.20); font-weight:600;">Find ad</span>
+            <span style="padding:8px 12px; border-radius:999px; background:rgba(84,130,255,0.10); border:1px solid rgba(84,130,255,0.20); font-weight:600;">Decode</span>
+            <span style="padding:8px 12px; border-radius:999px; background:rgba(84,130,255,0.10); border:1px solid rgba(84,130,255,0.20); font-weight:600;">Generate script</span>
+            <span style="padding:8px 12px; border-radius:999px; background:rgba(84,130,255,0.10); border:1px solid rgba(84,130,255,0.20); font-weight:600;">Preview video</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_hero_ctas() -> None:
+    hero_col1, hero_col2 = st.columns(2)
+    with hero_col1:
+        st.button("Analyze a competitor ad", use_container_width=True, key="hero-analyze-cta")
+    with hero_col2:
+        st.button("Upload your own video", use_container_width=True, key="hero-upload-cta")
+
+
 def render_pipeline_results(
     job_dir: Path,
     logs: str = "",
@@ -2469,7 +2564,7 @@ def render_pipeline_results(
 
     campaign_goal = goal or st.session_state.get("last_campaign_goal") or "Lead Generation"
 
-    st.subheader("Common Patterns Across Ads")
+    st.subheader("Winning Patterns")
     patterns = build_pattern_summary(ad_results)
     c1, c2, c3 = st.columns(3)
     c1.metric("Ads analyzed", len(ad_results))
@@ -2489,7 +2584,7 @@ def render_pipeline_results(
         st.write("**Repeated value propositions**")
         st.write(", ".join([k for k, _ in sorted(patterns["value_props"].items(), key=lambda x: x[1], reverse=True)[:5]]))
 
-    st.subheader("Per-Ad Insights")
+    st.subheader("Competitor Breakdown")
     for item in ad_results:
         insights = item["insights"]
         ad_name = insights.get("ad_id", item["ad_id"])
@@ -2550,7 +2645,7 @@ def render_pipeline_results(
             with st.expander("Raw JSON"):
                 st.json(insights)
 
-    st.subheader("Ad Recipe & Strategy")
+    st.subheader("Your Ad Blueprint")
     preview_rendered = False
     for item in ad_results:
         insights = item["insights"]
@@ -2573,7 +2668,7 @@ def render_pipeline_results(
                 strategy_payload = ensure_strategy_payload_for_item(item, campaign_goal)
 
         if not strategy_payload:
-            st.info(f"No saved recipe found for {ad_name}. Run Analyze Ads to generate strategy.")
+            st.info(f"No saved recipe found for {ad_name}. Run Analyze a competitor ad to generate strategy.")
             continue
 
         has_script_content = any(
@@ -2605,8 +2700,22 @@ def render_pipeline_results(
             st.code(logs or "No logs")
 
 
-st.title("FastAds")
-st.caption("Upload a competitor ad. Get the recipe to beat it.")
+st.markdown(
+    """
+    <div style="padding: 4px 0 8px 0;">
+        <div style="font-size: 2rem; font-weight: 800; line-height: 1.1; margin-bottom: 6px;">
+            Turn competitor ads into your next campaign
+        </div>
+        <div style="font-size: 1.02rem; color: rgba(49, 51, 63, 0.82); max-width: 980px;">
+            FastAds decodes any ad into Hook, Proof, Value, CTA — then generates a ready-to-run script and video preview.
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+render_workflow_strip()
+render_hero_ctas()
 
 st.subheader("Search Competitor Videos")
 youtube_tab, meta_tab = st.tabs(["YouTube Videos", "Meta Ads Library"])
@@ -2677,7 +2786,7 @@ with youtube_tab:
                                 "confidence": confidence,
                                 "duration_label": video.get("duration_label", "Unknown"),
                             }
-                            st.success("Video selected and downloaded. You can now click Analyze Ads.")
+                            st.success("Video selected and downloaded. You can now analyze a competitor ad.")
                         except Exception as exc:
                             st.session_state.selected_video_path = None
                             st.session_state.selected_video_meta = None
@@ -2751,7 +2860,7 @@ with st.form("fastads_input_form"):
         index=0,
     )
     competitor = st.text_input("Competitor name", value="competitor")
-    submitted = st.form_submit_button("Analyze Ads")
+    submitted = st.form_submit_button("Analyze a competitor ad")
 
 if submitted:
     st.session_state.last_campaign_goal = goal
@@ -2838,7 +2947,7 @@ if submitted:
                     if not ad_results:
                         st.error("No ad results found in latest job.")
                     else:
-                        st.subheader("Common Patterns Across Ads")
+                        st.subheader("Winning Patterns")
                         patterns = build_pattern_summary(ad_results)
                         c1, c2, c3 = st.columns(3)
                         c1.metric("Ads analyzed", len(ad_results))
@@ -2858,7 +2967,7 @@ if submitted:
                             st.write("**Repeated value propositions**")
                             st.write(", ".join([k for k, _ in sorted(patterns["value_props"].items(), key=lambda x: x[1], reverse=True)[:5]]))
 
-                        st.subheader("Per-Ad Insights")
+                        st.subheader("Competitor Breakdown")
                         for item in ad_results:
                             insights = item["insights"]
                             ad_name = insights.get("ad_id", item["ad_id"])
@@ -2919,7 +3028,7 @@ if submitted:
                                 with st.expander("Raw JSON"):
                                     st.json(insights)
 
-                        st.subheader("Ad Recipe & Strategy")
+                        st.subheader("Your Ad Blueprint")
                         for item in ad_results:
                             insights = item["insights"]
                             ad_name = insights.get("ad_id", item["ad_id"])
